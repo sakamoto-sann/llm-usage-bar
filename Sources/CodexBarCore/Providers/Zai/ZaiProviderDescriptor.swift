@@ -34,6 +34,11 @@ public enum ZaiProviderDescriptor {
                 resolveToken: { ProviderTokenResolver.zaiToken(environment: $0) },
                 missingCredentialsError: { ZaiSettingsError.missingToken },
                 loadUsage: { apiKey, context in
+                    if ZaiSettingsReader.apiToken(environment: context.env) == nil {
+                        return try await ZcodeUsageFetcher.fetchUsage(
+                            apiKey: apiKey,
+                            environment: context.env).toUsageSnapshot()
+                    }
                     let settings = context.settings?.zai
                     let region = settings?.apiRegion ?? .global
                     return try await ZaiUsageFetcher.fetchUsageWithModelUsage(

@@ -20,8 +20,11 @@ public enum ProviderTokenResolver {
         self.ampResolution(environment: environment)?.token
     }
 
-    public static func zaiToken(environment: [String: String] = ProcessInfo.processInfo.environment) -> String? {
-        self.zaiResolution(environment: environment)?.token
+    public static func zaiToken(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        zcodeConfigURL: URL? = nil) -> String?
+    {
+        self.zaiResolution(environment: environment, zcodeConfigURL: zcodeConfigURL)?.token
     }
 
     public static func syntheticToken(
@@ -229,9 +232,16 @@ public enum ProviderTokenResolver {
     }
 
     public static func zaiResolution(
-        environment: [String: String] = ProcessInfo.processInfo.environment) -> ProviderTokenResolution?
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        zcodeConfigURL: URL? = nil) -> ProviderTokenResolution?
     {
-        self.resolveEnv(ZaiSettingsReader.apiToken(environment: environment))
+        if let explicit = self.resolveEnv(ZaiSettingsReader.apiToken(environment: environment)) {
+            return explicit
+        }
+        if let token = ZcodeSettingsReader.apiToken(configURL: zcodeConfigURL) {
+            return ProviderTokenResolution(token: token, source: .authFile)
+        }
+        return nil
     }
 
     public static func syntheticResolution(
