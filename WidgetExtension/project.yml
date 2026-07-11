@@ -20,7 +20,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: CodexBar
+        CFBundleDisplayName: LLM Usage Bar
         CFBundleName: CodexBarWidget
         CFBundlePackageType: XPC!
         CFBundleShortVersionString: "$(MARKETING_VERSION)"

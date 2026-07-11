@@ -1017,6 +1017,7 @@
 "%dd" = "%d d";
 "1.5× headroom" = "1,5× de marxe";
 "About CodexBar" = "Acerca de CodexBar";
+"About LLM Usage Bar" = "About LLM Usage Bar";
 "Add Account..." = "Engadir conta...";
 "Add Google Account" = "Engadir conta de Google";
 "Add accounts via GitHub OAuth Device Flow on the selected host." = "Engade contas mediante o fluxo de dispositivo OAuth de GitHub no servidor seleccionado.";

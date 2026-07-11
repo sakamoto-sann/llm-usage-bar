@@ -752,6 +752,7 @@
 "Open Status Page" = "เปิดหน้าสถานะ";
 "Settings..." = "การตั้งค่า...";
 "About CodexBar" = "เกี่ยวกับ CodexBar";
+"About LLM Usage Bar" = "About LLM Usage Bar";
 "Quit" = "ออก";
 "Last %d day" = "%d วันที่ผ่านมา";
 "Last %d days" = "%d วันที่ผ่านมา";

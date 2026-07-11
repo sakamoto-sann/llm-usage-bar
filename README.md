@@ -1,4 +1,14 @@
-# CodexBar 🎚️ — May your tokens never run out.
+# LLM Usage Bar 🎚️
+
+Private macOS menu-bar build focused on usage limits for OpenAI Codex/ChatGPT,
+Cursor, Grok, and Devin. Based on the MIT-licensed
+[CodexBar](https://github.com/steipete/CodexBar); upstream attribution and license
+are preserved.
+
+Internal executable and storage identifiers intentionally remain `CodexBar` for
+upstream compatibility. The installed app and user-facing UI use `LLM Usage Bar`.
+
+---
 
 > Every AI coding limit, in your menu bar.
 
