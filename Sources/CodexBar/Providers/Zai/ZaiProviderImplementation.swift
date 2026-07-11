@@ -24,7 +24,7 @@ struct ZaiProviderImplementation: ProviderImplementation {
 
     @MainActor
     func isAvailable(context: ProviderAvailabilityContext) -> Bool {
-        if ZaiSettingsReader.apiToken(environment: context.environment) != nil {
+        if ProviderTokenResolver.zaiToken(environment: context.environment) != nil {
             return true
         }
         context.settings.ensureZaiAPITokenLoaded()
