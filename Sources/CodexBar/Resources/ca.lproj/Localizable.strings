@@ -1023,6 +1023,7 @@
 "%d%% in reserve" = "%d%% en reserva";
 "%dd" = "%dd";
 "About CodexBar" = "Quant al CodexBar";
+"About LLM Usage Bar" = "About LLM Usage Bar";
 "Add Account..." = "Afegiu un compte...";
 "Add accounts via GitHub OAuth Device Flow on the selected host." = "Afegiu comptes mitjançant el flux de dispositiu de GitHub OAuth a l'amfitrió seleccionat.";
 "Add Google Account" = "Afegiu un compte de Google";

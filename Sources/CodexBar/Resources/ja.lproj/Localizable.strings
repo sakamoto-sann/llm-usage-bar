@@ -748,6 +748,7 @@
 "Open Status Page" = "ステータスページを開く";
 "Settings..." = "設定...";
 "About CodexBar" = "CodexBar について";
+"About LLM Usage Bar" = "LLM Usage Bar について";
 "Quit" = "終了";
 "Last %d day" = "過去%d日間";
 "Last %d days" = "過去%d日間";

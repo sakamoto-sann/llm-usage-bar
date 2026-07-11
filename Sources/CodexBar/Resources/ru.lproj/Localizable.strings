@@ -752,6 +752,7 @@
 "Open Status Page" = "Открыть страницу статуса";
 "Settings..." = "Настройки…";
 "About CodexBar" = "О CodexBar";
+"About LLM Usage Bar" = "About LLM Usage Bar";
 "Quit" = "Выйти";
 "Last %d day" = "Последний %d день";
 "Last %d days" = "Последние %d дн.";

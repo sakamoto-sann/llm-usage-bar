@@ -751,6 +751,7 @@
 "Open Status Page" = "Ouvrir la page d'état";
 "Settings..." = "Réglages…";
 "About CodexBar" = "À propos de CodexBar";
+"About LLM Usage Bar" = "About LLM Usage Bar";
 "Quit" = "Quitter";
 "Last %d day" = "Dernier %d jour";
 "Last %d days" = "%d derniers jours";

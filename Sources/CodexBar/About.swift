@@ -45,7 +45,7 @@ func showAbout() {
     }
 
     let options: [NSApplication.AboutPanelOptionKey: Any] = [
-        .applicationName: "CodexBar",
+        .applicationName: "LLM Usage Bar",
         .applicationVersion: versionString,
         .version: versionString,
         .credits: credits,
