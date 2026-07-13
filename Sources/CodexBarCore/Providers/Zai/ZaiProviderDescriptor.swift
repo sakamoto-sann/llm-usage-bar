@@ -35,9 +35,23 @@ public enum ZaiProviderDescriptor {
                 missingCredentialsError: { ZaiSettingsError.missingToken },
                 loadUsage: { apiKey, context in
                     if ZaiSettingsReader.apiToken(environment: context.env) == nil {
-                        return try await ZcodeUsageFetcher.fetchUsage(
-                            apiKey: apiKey,
-                            environment: context.env).toUsageSnapshot()
+                        guard let credential = ZcodeSettingsReader.usageCredential(),
+                              credential.token == apiKey
+                        else {
+                            throw ZaiSettingsError.missingToken
+                        }
+                        switch credential.plan {
+                        case .codingPlan:
+                            return try await ZaiUsageFetcher.fetchUsageWithModelUsage(
+                                apiKey: apiKey,
+                                region: .global,
+                                usageScope: .personal,
+                                environment: context.env).toUsageSnapshot()
+                        case .startPlan:
+                            return try await ZcodeUsageFetcher.fetchUsage(
+                                apiKey: apiKey,
+                                environment: context.env).toUsageSnapshot()
+                        }
                     }
                     let settings = context.settings?.zai
                     let region = settings?.apiRegion ?? .global

@@ -7,6 +7,82 @@ import Testing
 
 struct ZcodeUsageTests {
     @Test
+    func `uses the available coding plan credential when a stale start plan token also exists`() throws {
+        let files = try self.makeConfig(
+            startPlanAPIKey: "stale-start-token",
+            codingPlanAPIKey: "active-coding-token",
+            statuses: [
+                "builtin:zai-start-plan": "unavailable",
+                "builtin:zai-coding-plan": "available",
+            ])
+        defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
+
+        let credential = try #require(ZcodeSettingsReader.usageCredential(
+            configURL: files.config,
+            statusURL: files.status))
+
+        #expect(credential.token == "active-coding-token")
+        #expect(credential.plan == .codingPlan)
+    }
+
+    @Test
+    func `uses an available start plan credential when coding plan is unavailable`() throws {
+        let files = try self.makeConfig(
+            startPlanAPIKey: "active-start-token",
+            codingPlanAPIKey: "stale-coding-token",
+            statuses: [
+                "builtin:zai-start-plan": "available",
+                "builtin:zai-coding-plan": "unavailable",
+            ])
+        defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
+
+        let credential = try #require(ZcodeSettingsReader.usageCredential(
+            configURL: files.config,
+            statusURL: files.status))
+
+        #expect(credential.token == "active-start-token")
+        #expect(credential.plan == .startPlan)
+    }
+
+    @Test
+    func `defaults to coding plan when status cache is missing or corrupt`() throws {
+        let files = try self.makeConfig(
+            startPlanAPIKey: "start-token",
+            codingPlanAPIKey: "coding-token")
+        defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
+
+        try Data("not-json".utf8).write(to: files.status, options: .atomic)
+        let corruptCacheCredential = try #require(ZcodeSettingsReader.usageCredential(
+            configURL: files.config,
+            statusURL: files.status))
+        #expect(corruptCacheCredential.token == "coding-token")
+        #expect(corruptCacheCredential.plan == .codingPlan)
+
+        try FileManager.default.removeItem(at: files.status)
+        let missingCacheCredential = try #require(ZcodeSettingsReader.usageCredential(
+            configURL: files.config,
+            statusURL: files.status))
+        #expect(missingCacheCredential.token == "coding-token")
+        #expect(missingCacheCredential.plan == .codingPlan)
+    }
+
+    @Test
+    func `does not hide a candidate when the status cache is only partially written`() throws {
+        let files = try self.makeConfig(
+            startPlanAPIKey: "start-token",
+            codingPlanAPIKey: "coding-token",
+            statuses: ["builtin:zai-start-plan": "unavailable"])
+        defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
+
+        let credential = try #require(ZcodeSettingsReader.usageCredential(
+            configURL: files.config,
+            statusURL: files.status))
+
+        #expect(credential.token == "coding-token")
+        #expect(credential.plan == .codingPlan)
+    }
+
+    @Test
     func `aggregates 100 plus 50 capacity using API totals`() throws {
         let json = #"""
         {"code":0,"data":{"balances":[
@@ -42,12 +118,12 @@ struct ZcodeUsageTests {
 
     @Test
     func `explicit environment credential wins over ZCode config`() throws {
-        let configURL = try self.makeConfig(apiKey: "zcode-token")
-        defer { try? FileManager.default.removeItem(at: configURL.deletingLastPathComponent()) }
+        let files = try self.makeConfig(codingPlanAPIKey: "zcode-token")
+        defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
 
         let resolution = ProviderTokenResolver.zaiResolution(
             environment: [ZaiSettingsReader.apiTokenKey: "explicit-token"],
-            zcodeConfigURL: configURL)
+            zcodeConfigURL: files.config)
 
         #expect(resolution?.token == "explicit-token")
         #expect(resolution?.source == .environment)
@@ -55,10 +131,10 @@ struct ZcodeUsageTests {
 
     @Test
     func `ZCode config is local credential fallback`() throws {
-        let configURL = try self.makeConfig(apiKey: "zcode-token")
-        defer { try? FileManager.default.removeItem(at: configURL.deletingLastPathComponent()) }
+        let files = try self.makeConfig(codingPlanAPIKey: "zcode-token")
+        defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
 
-        let resolution = ProviderTokenResolver.zaiResolution(environment: [:], zcodeConfigURL: configURL)
+        let resolution = ProviderTokenResolver.zaiResolution(environment: [:], zcodeConfigURL: files.config)
 
         #expect(resolution?.token == "zcode-token")
         #expect(resolution?.source == .authFile)
@@ -75,28 +151,72 @@ struct ZcodeUsageTests {
 
         let request = try #require(await transport.lastRequest())
         #expect(request.url?.host == "zcode.z.ai")
-        #expect(request.url?.path == "/api/v1/zcode-plan/billing/balance")
+        #expect(await transport.requestPaths() == [
+            "/api/v1/zcode-plan/billing/current",
+            "/api/v1/zcode-plan/billing/balance",
+        ])
         #expect(try URLComponents(url: #require(request.url), resolvingAgainstBaseURL: false)?
             .queryItems?.first(where: { $0.name == "app_version" })?.value == "9.9.9")
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer local-token")
     }
 
-    private func makeConfig(apiKey: String) throws -> URL {
+    @Test
+    func `reports no active Start Plan before requesting balances`() async throws {
+        let transport = ZcodeTransportStub(hasActivePlan: false)
+
+        do {
+            _ = try await ZcodeUsageFetcher.fetchUsage(apiKey: "local-token", transport: transport)
+            Issue.record("Expected the missing Start Plan to fail")
+        } catch let error as ZaiUsageError {
+            #expect(error.localizedDescription.contains("No active ZCode Start Plan"))
+        }
+
+        #expect(await transport.requestPaths() == ["/api/v1/zcode-plan/billing/current"])
+    }
+
+    private func makeConfig(
+        startPlanAPIKey: String? = nil,
+        codingPlanAPIKey: String? = nil,
+        statuses: [String: String] = [:]) throws -> (config: URL, status: URL)
+    {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let url = directory.appendingPathComponent("config.json")
-        let json = #"{"provider":{"builtin:zai-start-plan":{"options":{"apiKey":"\#(apiKey)"}}}}"#
-        try Data(json.utf8).write(to: url, options: .atomic)
-        return url
+        let configURL = directory.appendingPathComponent("config.json")
+        var providers: [String: Any] = [:]
+        if let startPlanAPIKey {
+            providers["builtin:zai-start-plan"] = ["options": ["apiKey": startPlanAPIKey]]
+        }
+        if let codingPlanAPIKey {
+            providers["builtin:zai-coding-plan"] = ["options": ["apiKey": codingPlanAPIKey]]
+        }
+        let config = ["provider": providers]
+        try JSONSerialization.data(withJSONObject: config).write(to: configURL, options: .atomic)
+
+        let statusURL = directory.appendingPathComponent("coding-plan-cache.json")
+        let items = statuses.mapValues { ["status": $0] }
+        let status = ["entryStatus": ["items": items]]
+        try JSONSerialization.data(withJSONObject: status).write(to: statusURL, options: .atomic)
+        return (configURL, statusURL)
     }
 }
 
 private actor ZcodeTransportStub: ProviderHTTPTransport {
-    private var request: URLRequest?
+    private var requests: [URLRequest] = []
+    private let hasActivePlan: Bool
+
+    init(hasActivePlan: Bool = true) {
+        self.hasActivePlan = hasActivePlan
+    }
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        self.request = request
-        let json = #"{"code":0,"data":{"balances":[{"total_units":150,"used_units":50,"remaining_units":100,"reset":null}]}}"#
+        self.requests.append(request)
+        let json = if request.url?.path.hasSuffix("/billing/current") == true {
+            self.hasActivePlan
+                ? #"{"code":0,"data":{"plans":[{"plan_id":"start"}]}}"#
+                : #"{"code":0,"data":{"plans":[]}}"#
+        } else {
+            #"{"code":0,"data":{"balances":[{"total_units":150,"used_units":50,"remaining_units":100,"reset":null}]}}"#
+        }
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: 200,
@@ -106,6 +226,10 @@ private actor ZcodeTransportStub: ProviderHTTPTransport {
     }
 
     func lastRequest() -> URLRequest? {
-        self.request
+        self.requests.last
+    }
+
+    func requestPaths() -> [String] {
+        self.requests.compactMap(\.url?.path)
     }
 }
