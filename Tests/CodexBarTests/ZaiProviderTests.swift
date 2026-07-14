@@ -962,7 +962,7 @@ struct ZaiAPIRegionTests {
     func `dashboard URLs follow selected region`() {
         #expect(
             ZaiAPIRegion.global.dashboardURL.absoluteString ==
-                "https://z.ai/manage-apikey/coding-plan/personal/my-plan")
+                "https://z.ai/manage-apikey/coding-plan/personal/usage")
         #expect(
             ZaiAPIRegion.bigmodelCN.dashboardURL.absoluteString ==
                 "https://bigmodel.cn/coding-plan/personal/usage")

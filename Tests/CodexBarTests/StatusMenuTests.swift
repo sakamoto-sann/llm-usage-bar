@@ -124,7 +124,7 @@ struct StatusMenuTests {
         #expect(controller.dashboardURL(for: .zai) == ZaiAPIRegion.global.dashboardURL)
         #expect(
             controller.dashboardURL(for: .zai)?.absoluteString ==
-                "https://z.ai/manage-apikey/coding-plan/personal/my-plan")
+                "https://z.ai/manage-apikey/coding-plan/personal/usage")
         #expect(
             controller.dashboardURL(
                 for: .zai,

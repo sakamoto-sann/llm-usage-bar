@@ -36,7 +36,7 @@ public enum ZaiAPIRegion: String, CaseIterable, Sendable {
     public var dashboardURL: URL {
         switch self {
         case .global:
-            URL(string: "https://z.ai/manage-apikey/coding-plan/personal/my-plan")!
+            URL(string: "https://z.ai/manage-apikey/coding-plan/personal/usage")!
         case .bigmodelCN:
             URL(string: "https://bigmodel.cn/coding-plan/personal/usage")!
         }

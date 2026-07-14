@@ -118,7 +118,7 @@ Copy each value once, on one line. Multi-line or duplicated IDs can make the API
   Organization ID and Project ID as required for team usage.
 
 ## Usage dashboard
-- Global: `https://z.ai/manage-apikey/coding-plan/personal/my-plan`
+- Global: `https://z.ai/manage-apikey/coding-plan/personal/usage`
 - BigModel China: `https://bigmodel.cn/coding-plan/personal/usage`
 - BigModel China team: `https://bigmodel.cn/coding-plan/team/usage-stats`
 - CodexBar's Usage Dashboard action follows the configured API region.
