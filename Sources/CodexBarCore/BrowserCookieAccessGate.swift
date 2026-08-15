@@ -63,6 +63,10 @@ public enum BrowserCookieAccessGate {
 
     static let allowTestCookieAccessEnvironmentKey = "CODEXBAR_ALLOW_TEST_BROWSER_COOKIE_ACCESS"
 
+    public static func requiresKeychainPromptAcknowledgement(for browsers: [Browser]) -> Bool {
+        browsers.contains(where: \.usesKeychainForCookieDecryption)
+    }
+
     static func cookieStoreAccessDecision(
         homeDirectories: [URL],
         processName: String = ProcessInfo.processInfo.processName,
@@ -82,6 +86,9 @@ public enum BrowserCookieAccessGate {
     public static func shouldAttempt(_ browser: Browser, now: Date = Date()) -> Bool {
         guard browser.usesKeychainForCookieDecryption else { return true }
         guard !KeychainAccessGate.isDisabled else { return false }
+        guard ProviderInteractionContext.current == .userInitiated else {
+            return self.shouldAttemptInBackground(browser, now: now)
+        }
         if self.deniedBrowsersForTesting?.contains(browser) == true {
             return self.isExplicitRetryAllowed(for: browser)
         }
@@ -198,6 +205,19 @@ public enum BrowserCookieAccessGate {
                 ])
     }
 
+    public static func hasActiveDenial(for browser: Browser, now: Date = Date()) -> Bool {
+        guard browser.usesKeychainForCookieDecryption else { return false }
+        return self.lock.withLock { state in
+            self.loadIfNeeded(&state)
+            guard let blockedUntil = state.deniedUntilByBrowser[browser.rawValue] else { return false }
+            guard blockedUntil <= now else { return true }
+            state.deniedUntilByBrowser.removeValue(forKey: browser.rawValue)
+            state.chromiumFamilyDeniedUntil = state.deniedUntilByBrowser.values.max()
+            self.persist(state)
+            return false
+        }
+    }
+
     static func recordAllowed(for browser: Browser) {
         guard browser.usesKeychainForCookieDecryption,
               ProviderInteractionContext.current == .userInitiated,
@@ -254,6 +274,69 @@ public enum BrowserCookieAccessGate {
                 return false
             case .interactionRequired:
                 return true
+            case .notFound, .failure:
+                continue
+            }
+        }
+        return false
+    }
+
+    /// Background (non-user-initiated) refreshes must never surface a Keychain prompt. Rather than
+    /// skipping unconditionally, reuse the strictly no-UI Safe Storage preflight: when the ACL already
+    /// grants access (an explicit `.allowed`), a scheduled refresh can read cookies without any prompt,
+    /// so background usage stays in sync instead of only updating when the menu is opened. Anything else
+    /// — interaction required, not found, or a query failure — keeps the no-surprise boundary and skips.
+    /// An active per-browser or Chromium-family denial cooldown is still honored.
+    private static func shouldAttemptInBackground(_ browser: Browser, now: Date) -> Bool {
+        if self.deniedBrowsersForTesting?.contains(browser) == true {
+            return false
+        }
+        if self.hasActiveDenialCooldown(for: browser, now: now) {
+            self.log.debug(
+                "Skipping background Chromium cookie import; denial cooldown active",
+                metadata: ["browser": browser.displayName])
+            return false
+        }
+        guard self.chromiumKeychainAccessIsAllowed(for: browser) else {
+            self.log.info(
+                "Skipping background Chromium cookie import to avoid a Keychain prompt",
+                metadata: ["browser": browser.displayName])
+            return false
+        }
+        self.log.debug(
+            "Background Chromium cookie import allowed by no-UI Keychain preflight",
+            metadata: ["browser": browser.displayName])
+        return true
+    }
+
+    /// Read-only check for an active per-browser or Chromium-family denial cooldown. Mirrors the
+    /// suppression window enforced on the user-initiated path without mutating persisted state, so a
+    /// scheduled refresh stays side-effect free.
+    private static func hasActiveDenialCooldown(for browser: Browser, now: Date) -> Bool {
+        self.lock.withLock { state in
+            self.loadIfNeeded(&state)
+            if let blockedUntil = state.deniedUntilByBrowser[browser.rawValue], blockedUntil > now {
+                return true
+            }
+            if let familyBlockedUntil = state.chromiumFamilyDeniedUntil, familyBlockedUntil > now {
+                return true
+            }
+            return false
+        }
+    }
+
+    /// Returns true only when the no-UI Safe Storage preflight explicitly reports `.allowed` for one of
+    /// the browser's labels before any label requires interaction. Symmetric with
+    /// `chromiumKeychainRequiresInteraction`; `.notFound`/`.failure` are skipped and never treated as a
+    /// grant, so only an already-authorized ACL enables a background read.
+    private static func chromiumKeychainAccessIsAllowed(for browser: Browser) -> Bool {
+        let labels = browser.safeStorageLabels.isEmpty ? self.safeStorageLabels : browser.safeStorageLabels
+        for label in labels {
+            switch KeychainAccessPreflight.checkGenericPassword(service: label.service, account: label.account) {
+            case .allowed:
+                return true
+            case .interactionRequired:
+                return false
             case .notFound, .failure:
                 continue
             }
@@ -325,6 +408,10 @@ extension BrowserCookieClient {
 }
 #else
 public enum BrowserCookieAccessGate {
+    public static func requiresKeychainPromptAcknowledgement(for browsers: [Browser]) -> Bool {
+        false
+    }
+
     public static func shouldAttempt(_ browser: Browser, now: Date = Date()) -> Bool {
         true
     }
@@ -350,6 +437,10 @@ public enum BrowserCookieAccessGate {
 
     public static func recordIfNeeded(_ error: Error, now: Date = Date()) {}
     public static func recordDenied(for browser: Browser, now: Date = Date()) {}
+    public static func hasActiveDenial(for browser: Browser, now: Date = Date()) -> Bool {
+        false
+    }
+
     public static func resetForTesting() {}
 }
 #endif

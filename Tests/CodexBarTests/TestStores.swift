@@ -69,22 +69,6 @@ final class InMemoryKimiTokenStore: KimiTokenStoring, @unchecked Sendable {
     }
 }
 
-final class InMemoryKimiK2TokenStore: KimiK2TokenStoring, @unchecked Sendable {
-    var value: String?
-
-    init(value: String? = nil) {
-        self.value = value
-    }
-
-    func loadToken() throws -> String? {
-        self.value
-    }
-
-    func storeToken(_ token: String?) throws {
-        self.value = token
-    }
-}
-
 final class InMemoryCopilotTokenStore: CopilotTokenStoring, @unchecked Sendable {
     var value: String?
 
@@ -168,7 +152,6 @@ func testSettingsStore(
         minimaxCookieStore: InMemoryMiniMaxCookieStore(),
         minimaxAPITokenStore: InMemoryMiniMaxAPITokenStore(),
         kimiTokenStore: InMemoryKimiTokenStore(),
-        kimiK2TokenStore: InMemoryKimiK2TokenStore(),
         augmentCookieStore: InMemoryCookieHeaderStore(),
         ampCookieStore: InMemoryCookieHeaderStore(),
         copilotTokenStore: InMemoryCopilotTokenStore(),
@@ -188,13 +171,14 @@ func withStatusItemControllerForTesting<T>(
     store: UsageStore,
     settings: SettingsStore,
     fetcher: UsageFetcher,
+    account: AccountInfo? = nil,
     statusBar: NSStatusBar = .system,
     operation: (StatusItemController) throws -> T) rethrows -> T
 {
     let controller = StatusItemController(
         store: store,
         settings: settings,
-        account: fetcher.loadAccountInfo(),
+        account: account ?? fetcher.loadAccountInfo(),
         updater: DisabledUpdaterController(),
         preferencesSelection: PreferencesSelection(),
         statusBar: statusBar)
@@ -208,13 +192,14 @@ func withStatusItemControllerForTesting<T>(
     store: UsageStore,
     settings: SettingsStore,
     fetcher: UsageFetcher,
+    account: AccountInfo? = nil,
     statusBar: NSStatusBar = .system,
     operation: (StatusItemController) async throws -> T) async rethrows -> T
 {
     let controller = StatusItemController(
         store: store,
         settings: settings,
-        account: fetcher.loadAccountInfo(),
+        account: account ?? fetcher.loadAccountInfo(),
         updater: DisabledUpdaterController(),
         preferencesSelection: PreferencesSelection(),
         statusBar: statusBar)

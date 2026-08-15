@@ -4,14 +4,57 @@ import Testing
 
 struct ClaudeWebFetchDeadlineTests {
     @Test
+    func `prepaid timeout preserves usage before outer web deadline`() async throws {
+        let context = Self.makeContext(sourceMode: .web, webTimeout: 0.5)
+        let transport = ProviderHTTPTransportHandler { request in
+            let url = try #require(request.url)
+            let body: String
+            let statusCode: Int
+            switch url.path {
+            case "/api/organizations":
+                body = #"[{"uuid":"org-123","name":"Test Org","capabilities":["chat"]}]"#
+                statusCode = 200
+            case "/api/organizations/org-123/usage":
+                body = #"{"five_hour":{"utilization":11}}"#
+                statusCode = 200
+            case "/api/organizations/org-123/prepaid/credits":
+                try await Task.sleep(for: .seconds(10))
+                throw CancellationError()
+            default:
+                body = "{}"
+                statusCode = 404
+            }
+            let response = try #require(HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]))
+            return (Data(body.utf8), response)
+        }
+        let strategy = ClaudeWebFetchStrategy(browserDetection: context.browserDetection)
+        let result = try await ClaudeWebPrepaidCreditsRequest.$timeoutOverrideForTesting.withValue(
+            .milliseconds(20))
+        {
+            try await ClaudeWebHTTPTransport.$overrideForTesting.withValue(transport) {
+                try await strategy.fetch(context)
+            }
+        }
+
+        #expect(result.usage.primary?.usedPercent == 11)
+        #expect(result.usage.providerCost?.balance == nil)
+    }
+
+    @Test
     func `CLI auto descriptor defers browser probe and falls back after web deadline`() async throws {
         let planningProbe = ClaudeWebPlanningAvailabilityProbe()
         let webProbe = ClaudeWebDeadlineProbe()
+        let cliPath = try Self.makeLoggedInClaudeCLI()
+        defer { try? FileManager.default.removeItem(atPath: cliPath) }
         let context = Self.makeContext(
             sourceMode: .auto,
             webTimeout: 0.01,
             cookieSource: .auto,
-            env: ["CLAUDE_CLI_PATH": "/usr/bin/true"])
+            env: ["CLAUDE_CLI_PATH": cliPath])
         let availabilityOverride: @Sendable (ProviderFetchContext, BrowserDetection) -> Bool = { _, _ in
             planningProbe.stallAndReportUnavailable()
         }
@@ -47,6 +90,13 @@ struct ClaudeWebFetchDeadlineTests {
     func `stalled app auto browser probe does not delay CLI success`() async throws {
         let planningProbe = ClaudeWebPlanningAvailabilityProbe()
         let cliPath = try Self.makeLoggedInClaudeCLI()
+        defer { try? FileManager.default.removeItem(atPath: cliPath) }
+        let profileRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexbar-claude-web-deadline-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: profileRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: profileRoot) }
+        try Data(#"{"oauthAccount":{"accountUuid":"deadline-account"}}"#.utf8)
+            .write(to: profileRoot.appendingPathComponent(".config.json"), options: .atomic)
         let context = Self.makeContext(
             runtime: .app,
             sourceMode: .auto,
@@ -54,28 +104,33 @@ struct ClaudeWebFetchDeadlineTests {
             cookieSource: .auto,
             env: [
                 "CLAUDE_CLI_PATH": cliPath,
-                ClaudeOAuthCredentialsStore.environmentTokenKey: "oauth-token",
+                "CLAUDE_CONFIG_DIR": profileRoot.path,
             ])
         let availabilityOverride: @Sendable (ProviderFetchContext, BrowserDetection) -> Bool = { _, _ in
             planningProbe.stallAndReportUnavailable()
         }
-        let oauthLoadOverride: (@Sendable (
-            [String: String],
-            Bool,
-            Bool) async throws -> ClaudeOAuthCredentials)? = { _, _, _ in
-            throw ClaudeUsageError.oauthFailed("stub OAuth failure")
-        }
+        let oauthLoadOverride: @Sendable ([String: String], Bool, Bool) async throws
+            -> ClaudeOAuthCredentials = { _, _, _ in
+                throw ClaudeOAuthCredentialsError.notFound
+            }
         let cliFetchOverride: @Sendable (String, TimeInterval, Bool) async throws -> ClaudeStatusSnapshot =
             { _, _, _ in Self.makeClaudeStatus() }
 
-        let outcome = await ClaudeWebFetchStrategy.$availabilityProbeOverrideForTesting.withValue(
-            availabilityOverride)
-        {
-            await ClaudeUsageFetcher.$loadOAuthCredentialsOverride.withValue(oauthLoadOverride) {
-                await ClaudeStatusProbe.$fetchOverride.withValue(cliFetchOverride) {
-                    await ClaudeProviderDescriptor.makeDescriptor().fetchPlan.fetchOutcome(
-                        context: context,
-                        provider: .claude)
+        let outcome = await ClaudeCLIBackgroundAvailability.withIsolatedStoreForTesting {
+            ClaudeCLIBackgroundAvailability.establish(binary: cliPath, environment: context.env)
+            return await KeychainAccessGate.withTaskOverrideForTesting(false) {
+                await ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.always) {
+                    await ClaudeWebFetchStrategy.$availabilityProbeOverrideForTesting.withValue(
+                        availabilityOverride)
+                    {
+                        await ClaudeUsageFetcher.$loadOAuthCredentialsOverride.withValue(oauthLoadOverride) {
+                            await ClaudeStatusProbe.$fetchOverride.withValue(cliFetchOverride) {
+                                await ClaudeProviderDescriptor.makeDescriptor().fetchPlan.fetchOutcome(
+                                    context: context,
+                                    provider: .claude)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -95,18 +150,9 @@ struct ClaudeWebFetchDeadlineTests {
             sourceMode: .auto,
             webTimeout: 60,
             cookieSource: .auto,
-            env: [
-                "CLAUDE_CLI_PATH": "/usr/bin/true",
-                ClaudeOAuthCredentialsStore.environmentTokenKey: "oauth-token",
-            ])
+            env: ["CLAUDE_CLI_PATH": "/usr/bin/true"])
         let availabilityOverride: @Sendable (ProviderFetchContext, BrowserDetection) -> Bool = { _, _ in
             planningProbe.stallAndReportUnavailable()
-        }
-        let oauthLoadOverride: (@Sendable (
-            [String: String],
-            Bool,
-            Bool) async throws -> ClaudeOAuthCredentials)? = { _, _, _ in
-            throw ClaudeUsageError.oauthFailed("stub OAuth failure")
         }
         let cliFetchOverride: @Sendable (String, TimeInterval, Bool) async throws -> ClaudeStatusSnapshot = { _, _, _ in
             throw ClaudeUsageError.parseFailed("stub CLI failure")
@@ -119,12 +165,10 @@ struct ClaudeWebFetchDeadlineTests {
         let fetchTask = Task {
             await ClaudeWebFetchStrategy.$availabilityProbeOverrideForTesting.withValue(availabilityOverride) {
                 await ClaudeWebFetchStrategy.$usageLoaderOverrideForTesting.withValue(usageLoader) {
-                    await ClaudeUsageFetcher.$loadOAuthCredentialsOverride.withValue(oauthLoadOverride) {
-                        await ClaudeStatusProbe.$fetchOverride.withValue(cliFetchOverride) {
-                            await ClaudeProviderDescriptor.makeDescriptor().fetchPlan.fetchOutcome(
-                                context: context,
-                                provider: .claude)
-                        }
+                    await ClaudeStatusProbe.$fetchOverride.withValue(cliFetchOverride) {
+                        await ClaudeProviderDescriptor.makeDescriptor().fetchPlan.fetchOutcome(
+                            context: context,
+                            provider: .claude)
                     }
                 }
             }

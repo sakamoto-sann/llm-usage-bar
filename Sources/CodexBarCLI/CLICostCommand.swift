@@ -3,7 +3,8 @@ import Commander
 import Foundation
 
 extension CodexBarCLI {
-    private static let costSupportedProviders: Set<UsageProvider> = [.claude, .codex]
+    private static let costSupportedProviders = Set(
+        ProviderDescriptorRegistry.all.filter(\.cli.supportsCostCommand).map(\.id))
 
     static func runCost(_ values: ParsedValues) async {
         let output = CLIOutputPreferences.from(values: values)
@@ -23,17 +24,31 @@ extension CodexBarCLI {
         guard !providers.isEmpty else {
             Self.exit(
                 code: .failure,
-                message: "Error: cost is only supported for Claude and Codex.",
+                message: "Error: cost is only supported for \(Self.costSupportedProviderNames()).",
                 output: output,
                 kind: .args)
         }
 
         let format = output.format
         let forceRefresh = values.flags.contains("refresh")
+        let includePiSessions = Self.decodeCostIncludePiSessions(from: values)
         let useColor = Self.shouldUseColor(noColor: values.flags.contains("noColor"), format: format)
         let historyDays = Self.decodeCostHistoryDays(from: values)
+        // Cursor cost reuses the same cookie-source policy as usage fetches: reject the fetch when the
+        // user set Cursor cookies to Off, and forward the Manual header so the dashboard request uses
+        // the configured session instead of auto-resolving a different one.
+        let cursorCookieSettings: ProviderSettingsSnapshot.CursorProviderSettings?
+        let cursorCookieSettingsError: Error?
+        do {
+            cursorCookieSettings = try Self.cursorCookieSettings(config: config, providers: providers)
+            cursorCookieSettingsError = nil
+        } catch {
+            cursorCookieSettings = nil
+            cursorCookieSettingsError = error
+        }
         let groupBy = Self.decodeCostGroupBy(from: values)
         if groupBy == .project {
+            // Provider-specific by design: only Codex JSONL sessions carry the local project attribution index.
             let unsupportedProjectProviders = providers.filter { $0 != .codex }
             if !unsupportedProjectProviders.isEmpty, !output.jsonOnly {
                 let names = unsupportedProjectProviders
@@ -49,14 +64,31 @@ extension CodexBarCLI {
         var payload: [CostPayload] = []
         var exitCode: ExitCode = .success
 
+        // Provider-specific by design: project grouping is available only for Codex local session data.
         for provider in providers where groupBy != .project || provider == .codex || format == .json {
+            if let error = Self.cursorCostAvailabilityError(
+                provider,
+                settings: cursorCookieSettings,
+                resolutionError: cursorCookieSettingsError)
+            {
+                exitCode = Self.mapError(error)
+                if format == .json {
+                    payload.append(Self.makeCostPayload(provider: provider, snapshot: nil, error: error))
+                } else if !output.jsonOnly {
+                    Self.writeStderr("Error: \(error.localizedDescription)\n")
+                }
+                continue
+            }
             do {
-                // Cost usage is local-only; it does not require web/CLI provider fetches.
+                // Claude/Codex cost comes from local logs; Cursor cost is fetched from its
+                // cookie-authenticated dashboard API via the shared session resolution.
                 let snapshot = try await fetcher.loadTokenSnapshot(
                     provider: provider,
                     forceRefresh: forceRefresh,
                     historyDays: historyDays,
-                    refreshPricingInBackground: false)
+                    cursorCookieHeaderOverride: Self.cursorCostHeaderOverride(provider, settings: cursorCookieSettings),
+                    refreshPricingInBackground: false,
+                    includePiSessions: includePiSessions)
                 switch format {
                 case .text:
                     sections.append(Self.renderCostText(
@@ -103,7 +135,11 @@ extension CodexBarCLI {
         useColor: Bool) -> String
     {
         let name = ProviderDescriptorRegistry.descriptor(for: provider).metadata.displayName
-        let header = Self.costHeaderLine("\(name) Cost (API-rate estimate)", useColor: useColor)
+        // Provider-specific by design: Codex cost is explicitly an API-equivalent local-session estimate.
+        let title = provider == .codex
+            ? "\(name) API-equivalent estimate (not billed)"
+            : "\(name) Cost (API-rate estimate)"
+        let header = Self.costHeaderLine(title, useColor: useColor)
         if groupBy == .project, provider == .codex {
             return Self.renderProjectCostText(header: header, snapshot: snapshot)
         }
@@ -122,8 +158,17 @@ extension CodexBarCLI {
             "\(historyLabel): \(monthCost) · \($0) tokens"
         } ?? "\(historyLabel): \(monthCost)"
 
-        let hintLine = UsageFormatter.costEstimateHint(provider: provider)
-        return [header, todayLine, monthLine, hintLine].joined(separator: "\n")
+        // Plan-metered spend over the same window (what Cursor actually deducts), shown
+        // alongside the API-rate estimate. Only providers like Cursor report it.
+        let meteredLine: String? = snapshot.meteredCostUSD.map {
+            let amount = UsageFormatter.currencyString($0, currencyCode: snapshot.currencyCode)
+            return "Cursor-metered: \(amount) (\(historyLabel.lowercased()))"
+        }
+
+        let hintLine = Self.costEstimateHint(provider: provider)
+        return [header, todayLine, monthLine, meteredLine, hintLine]
+            .compactMap(\.self)
+            .joined(separator: "\n")
     }
 
     private static func renderProjectCostText(header: String, snapshot: CostUsageTokenSnapshot) -> String {
@@ -132,7 +177,7 @@ extension CodexBarCLI {
         var lines = [header, "Projects (\(historyLabel)):"]
         guard !snapshot.projects.isEmpty else {
             lines.append("—")
-            lines.append(UsageFormatter.costEstimateHint(provider: .codex))
+            lines.append(Self.costEstimateHint(provider: .codex))
             return lines.joined(separator: "\n")
         }
         for project in snapshot.projects {
@@ -155,8 +200,14 @@ extension CodexBarCLI {
                 }
             }
         }
-        lines.append(UsageFormatter.costEstimateHint(provider: .codex))
+        lines.append(Self.costEstimateHint(provider: .codex))
         return lines.joined(separator: "\n")
+    }
+
+    private static func costEstimateHint(provider: UsageProvider) -> String {
+        provider == .codex
+            ? "Not a subscription bill or plan value · local usage × public API prices"
+            : UsageFormatter.costEstimateHint(provider: provider)
     }
 
     private static func costHeaderLine(_ header: String, useColor: Bool) -> String {
@@ -197,14 +248,17 @@ extension CodexBarCLI {
 
         return CostPayload(
             provider: provider.rawValue,
-            source: "local",
+            // Provider-specific by design: Cursor cost comes from its authenticated dashboard, not local logs.
+            source: provider == .cursor ? "web" : "local",
             updatedAt: snapshot?.updatedAt ?? (error == nil ? nil : Date()),
             currencyCode: snapshot?.currencyCode,
             sessionTokens: snapshot?.sessionTokens,
             sessionCostUSD: snapshot?.sessionCostUSD,
             historyDays: snapshot?.historyDays,
+            historyCoverageIsEstablished: snapshot?.historyCoverageIsEstablished,
             last30DaysTokens: snapshot?.last30DaysTokens,
             last30DaysCostUSD: snapshot?.last30DaysCostUSD,
+            meteredCostUSD: snapshot?.meteredCostUSD,
             daily: daily,
             projects: projects,
             totals: snapshot.flatMap(Self.costTotals(from:)),
@@ -303,11 +357,82 @@ extension CodexBarCLI {
         return max(1, min(365, parsed))
     }
 
+    static func decodeCostIncludePiSessions(from values: ParsedValues) -> Bool {
+        !values.flags.contains("providerNativeOnly")
+    }
+
     private static func decodeCostGroupBy(from values: ParsedValues) -> CostGroupBy {
         guard let raw = values.options["groupBy"]?.last?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty
         else { return .none }
         return CostGroupBy(rawValue: raw.lowercased()) ?? .none
+    }
+
+    /// Human-readable list of providers that support a cost report, used by both `cost` and serve.
+    static func costSupportedProviderNames() -> String {
+        self.costSupportedProviders
+            .map { ProviderDescriptorRegistry.descriptor(for: $0).metadata.displayName }
+            .sorted()
+            .joined(separator: ", ")
+    }
+
+    /// Resolve the configured Cursor cookie settings (source + manual header) the same way the CLI
+    /// usage path does, so Cursor cost honors Off/Manual instead of always auto-resolving a session.
+    /// Shared by `cost`, the serve `/cost` route, and dashboard snapshot collection.
+    static func cursorCookieSettings(
+        config: CodexBarConfig,
+        providers: [UsageProvider]) throws -> ProviderSettingsSnapshot.CursorProviderSettings?
+    {
+        // Provider-specific by design: Cursor cost fetches must resolve its selected dashboard-cookie account.
+        guard providers.contains(.cursor) else { return nil }
+        let selection = TokenAccountCLISelection(label: nil, index: nil, allAccounts: false)
+        let context = try TokenAccountCLIContext(selection: selection, config: config, verbose: false)
+        let account = try context.resolvedAccounts(for: .cursor).first
+        return context.settingsSnapshot(for: .cursor, account: account)?.cursor
+    }
+
+    /// Return the actionable error for a Cursor cost fetch disabled by cookie-source policy.
+    static func cursorCostAvailabilityError(
+        _ provider: UsageProvider,
+        settings: ProviderSettingsSnapshot.CursorProviderSettings?,
+        resolutionError: Error? = nil) -> Error?
+    {
+        guard provider == .cursor else { return nil }
+        if let resolutionError {
+            return resolutionError
+        }
+        guard let settings else { return nil }
+        switch settings.cookieSource {
+        case .off:
+            return CursorCostAvailabilityError.cookieSourceOff
+        case .manual where CookieHeaderNormalizer.normalize(settings.manualCookieHeader) == nil:
+            return CursorCostAvailabilityError.manualCookieMissing
+        default:
+            return nil
+        }
+    }
+
+    /// Manual cookie header to forward for a Cursor cost fetch, or nil for auto/non-cursor sources.
+    static func cursorCostHeaderOverride(
+        _ provider: UsageProvider,
+        settings: ProviderSettingsSnapshot.CursorProviderSettings?) -> String?
+    {
+        guard provider == .cursor, settings?.cookieSource == .manual else { return nil }
+        return CookieHeaderNormalizer.normalize(settings?.manualCookieHeader)
+    }
+}
+
+enum CursorCostAvailabilityError: LocalizedError {
+    case cookieSourceOff
+    case manualCookieMissing
+
+    var errorDescription: String? {
+        switch self {
+        case .cookieSourceOff:
+            "Cursor cost is unavailable because the Cursor cookie source is set to Off."
+        case .manualCookieMissing:
+            "Cursor cost requires a non-empty Manual cookie header."
+        }
     }
 }
 
@@ -344,6 +469,11 @@ struct CostOptions: CommanderParsable {
     @Flag(name: .long("refresh"), help: "Force refresh by ignoring cached scans")
     var refresh: Bool = false
 
+    @Flag(
+        name: .long("provider-native-only"),
+        help: "Experimental: exclude pi and OMP session mirrors from Claude/Codex cost history")
+    var providerNativeOnly: Bool = false
+
     @Option(name: .long("days"), help: "Cost history window in days (1...365)")
     var days: Int?
 
@@ -359,8 +489,10 @@ struct CostPayload: Encodable, Sendable {
     let sessionTokens: Int?
     let sessionCostUSD: Double?
     let historyDays: Int?
+    let historyCoverageIsEstablished: Bool?
     let last30DaysTokens: Int?
     let last30DaysCostUSD: Double?
+    let meteredCostUSD: Double?
     let daily: [CostDailyEntryPayload]
     let projects: [CostProjectPayload]
     let totals: CostTotalsPayload?
@@ -374,8 +506,10 @@ struct CostPayload: Encodable, Sendable {
         sessionTokens: Int?,
         sessionCostUSD: Double?,
         historyDays: Int?,
+        historyCoverageIsEstablished: Bool? = nil,
         last30DaysTokens: Int?,
         last30DaysCostUSD: Double?,
+        meteredCostUSD: Double? = nil,
         daily: [CostDailyEntryPayload],
         projects: [CostProjectPayload] = [],
         totals: CostTotalsPayload?,
@@ -388,8 +522,10 @@ struct CostPayload: Encodable, Sendable {
         self.sessionTokens = sessionTokens
         self.sessionCostUSD = sessionCostUSD
         self.historyDays = historyDays
+        self.historyCoverageIsEstablished = historyCoverageIsEstablished
         self.last30DaysTokens = last30DaysTokens
         self.last30DaysCostUSD = last30DaysCostUSD
+        self.meteredCostUSD = meteredCostUSD
         self.daily = daily
         self.projects = projects
         self.totals = totals

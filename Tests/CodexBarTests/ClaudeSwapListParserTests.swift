@@ -24,7 +24,10 @@ struct ClaudeSwapListParserTests {
               "usageStatus": "ok",
               "usage": {
                 "fiveHour": {"pct": 25.0, "resetsAt": "2026-06-22T23:29:59Z", "countdown": "1h"},
-                "sevenDay": {"pct": 16.5, "resetsAt": "2026-06-26T17:59:59Z"}
+                "sevenDay": {"pct": 16.5, "resetsAt": "2026-06-26T17:59:59Z"},
+                "scoped": [
+                  {"pct": 33.0, "name": "Fable", "resetsAt": "2026-06-26T17:59:59Z"}
+                ]
               },
               "usageFetchedAt": "2026-06-22T20:00:00Z",
               "usageAgeSeconds": 42.0
@@ -52,12 +55,53 @@ struct ClaudeSwapListParserTests {
         #expect(first.fiveHour?.usedPercent == 25.0)
         #expect(first.fiveHour?.resetsAt == Date(timeIntervalSince1970: 1_782_170_999))
         #expect(first.sevenDay?.usedPercent == 16.5)
+        #expect(first.scoped == [
+            ClaudeSwapScopedUsageWindow(
+                name: "Fable",
+                usedPercent: 33,
+                resetsAt: Date(timeIntervalSince1970: 1_782_496_799)),
+        ])
 
         let second = try #require(list.accounts.last)
         #expect(second.isActive == true)
         #expect(second.fiveHour?.usedPercent == 80)
         #expect(second.fiveHour?.resetsAt == nil)
         #expect(second.sevenDay == nil)
+        #expect(second.scoped.isEmpty)
+    }
+
+    @Test
+    func `ignores malformed and unknown scoped rows without losing account windows`() throws {
+        let json = """
+        {
+          "schemaVersion": 1,
+          "activeAccountNumber": 1,
+          "accounts": [{
+            "number": 1,
+            "active": true,
+            "usageStatus": "ok",
+            "usage": {
+              "fiveHour": {"pct": 19.0},
+              "sevenDay": {"pct": 42.0},
+              "scoped": [
+                {"pct": 133.0, "name": "  Fable  ", "resetsAt": "2026-07-21T08:00:00Z"},
+                {"pct": 17.0, "name": "All models"},
+                {"scope": "future_scope", "pct": 5.0},
+                {"pct": "unknown", "name": "Example Model"},
+                {"pct": 8.0, "name": "Bad Reset", "resetsAt": "next week"},
+                "future-shape"
+              ]
+            }
+          }]
+        }
+        """
+
+        let row = try #require(self.parse(json).accounts.first)
+        #expect(row.fiveHour?.usedPercent == 19)
+        #expect(row.sevenDay?.usedPercent == 42)
+        #expect(row.scoped.map(\.name) == ["Fable", "All models"])
+        #expect(row.scoped.map(\.usedPercent) == [100, 17])
+        #expect(row.scoped.first?.resetsAt == Date(timeIntervalSince1970: 1_784_620_800))
     }
 
     @Test
@@ -97,6 +141,30 @@ struct ClaudeSwapListParserTests {
             .unavailable,
             .unknown("brand_new_status"),
         ])
+    }
+
+    @Test
+    func `projects relogin required status to recovery guidance`() throws {
+        let json = """
+        {
+          "schemaVersion": 1,
+          "activeAccountNumber": null,
+          "accounts": [
+            {
+              "number": 1,
+              "email": "expired@example.com",
+              "active": false,
+              "usageStatus": "relogin_required",
+              "usage": null
+            }
+          ]
+        }
+        """
+
+        let list = try self.parse(json)
+        let account = try #require(ClaudeSwapAccountProjection.accountSnapshots(from: list).first)
+        #expect(account.error == "Re-login required. Re-authenticate this account in claude-swap.")
+        #expect(account.canActivate == false)
     }
 
     @Test

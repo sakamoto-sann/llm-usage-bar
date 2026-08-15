@@ -349,11 +349,7 @@ struct CLISnapshotTests {
     @Test
     func `renders crof dollar balance as detail not reset`() {
         let meta = ProviderDescriptorRegistry.descriptor(for: .crof).metadata
-        let snap = CrofUsageSnapshot(
-            credits: 9.9999,
-            requestsPlan: 1000,
-            usableRequests: 998,
-            updatedAt: Date(timeIntervalSince1970: 0)).toUsageSnapshot()
+        let snap = CrofTestSnapshots.credits(9.9999, updatedAt: Date(timeIntervalSince1970: 0))
 
         let output = CLIRenderer.renderText(
             provider: .crof,
@@ -365,10 +361,34 @@ struct CLISnapshotTests {
                 useColor: false,
                 resetStyle: .countdown))
 
-        #expect(output.contains("\(meta.sessionLabel): 99% left"))
-        #expect(output.contains("\(meta.weeklyLabel): 100% left"))
+        #expect(output.contains("\(meta.sessionLabel): 100% left"))
         #expect(output.contains("$9.99"))
         #expect(!output.contains("Resets $9.99"))
+        #expect(!output.contains("requests left"))
+    }
+
+    @Test
+    func `renders crof request quota when returned`() {
+        let snap = CrofTestSnapshots.requestQuota(
+            credits: 9.9999,
+            plan: 1000,
+            remaining: 998,
+            updatedAt: Date(timeIntervalSince1970: 0))
+
+        let output = CLIRenderer.renderText(
+            provider: .crof,
+            snapshot: snap,
+            credits: nil,
+            context: RenderContext(
+                header: "Crof",
+                status: nil,
+                useColor: false,
+                resetStyle: .countdown))
+
+        #expect(output.contains("Requests: 99% left"))
+        #expect(output.contains("998 requests left"))
+        #expect(output.contains("Credits: 100% left"))
+        #expect(output.contains("$9.99"))
     }
 
     @Test
@@ -567,6 +587,260 @@ struct CLISnapshotTests {
     }
 
     @Test
+    func `Kimi routes inverted quota windows to CLI pace and JSON metadata`() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 30,
+                windowMinutes: KimiProviderDescriptor.weeklyWindowMinutes,
+                resetsAt: now.addingTimeInterval(4 * 24 * 60 * 60),
+                resetDescription: "weekly"),
+            secondary: .init(
+                usedPercent: 10,
+                windowMinutes: KimiProviderDescriptor.sessionWindowMinutes,
+                resetsAt: now.addingTimeInterval(4 * 60 * 60),
+                resetDescription: "rate limit"),
+            tertiary: nil,
+            updatedAt: now)
+
+        let pace = try #require(CLIRenderer.providerPacePayload(provider: .kimi, snapshot: snapshot, now: now))
+        #expect(pace.primary?.expectedUsedPercent == 43)
+        #expect(pace.primary?.summary == "13% in reserve | Expected 43% used | Lasts until reset")
+        #expect(pace.secondary?.expectedUsedPercent == 20)
+        #expect(pace.secondary?.summary == "10% in reserve | Expected 20% used | Lasts until reset")
+
+        let output = CLIRenderer.renderText(
+            provider: .kimi,
+            snapshot: snapshot,
+            credits: nil,
+            context: RenderContext(
+                header: "Kimi",
+                status: nil,
+                useColor: false,
+                resetStyle: .countdown),
+            now: now)
+        #expect(output.split(separator: "\n").count(where: { $0.contains("Pace:") }) == 2)
+
+        let payload = ProviderPayload(
+            provider: .kimi,
+            account: nil,
+            version: nil,
+            source: "Kimi Code API key",
+            status: nil,
+            usage: snapshot,
+            credits: nil,
+            antigravityPlanInfo: nil,
+            openaiDashboard: nil,
+            error: nil,
+            pace: pace)
+        let data = try JSONEncoder().encode(payload)
+        let root = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let usage = try #require(root["usage"] as? [String: Any])
+        let primary = try #require(usage["primary"] as? [String: Any])
+        let secondary = try #require(usage["secondary"] as? [String: Any])
+        #expect(primary["windowMinutes"] as? Int == KimiProviderDescriptor.weeklyWindowMinutes)
+        #expect(secondary["windowMinutes"] as? Int == KimiProviderDescriptor.sessionWindowMinutes)
+        let encodedPace = try #require(root["pace"] as? [String: Any])
+        #expect(encodedPace["primary"] != nil)
+        #expect(encodedPace["secondary"] != nil)
+    }
+
+    @Test
+    func `zai routes verified coding windows to CLI pace`() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 50,
+                windowMinutes: 5 * 60,
+                resetsAt: now.addingTimeInterval(2.5 * 60 * 60),
+                resetDescription: "5-hour"),
+            secondary: .init(
+                usedPercent: 50,
+                windowMinutes: 7 * 24 * 60,
+                resetsAt: now.addingTimeInterval(3.5 * 24 * 60 * 60),
+                resetDescription: "weekly"),
+            tertiary: nil,
+            updatedAt: now)
+
+        let pace = try #require(CLIRenderer.providerPacePayload(provider: .zai, snapshot: snapshot, now: now))
+        #expect(pace.primary?.expectedUsedPercent == 50)
+        #expect(pace.secondary?.expectedUsedPercent == 50)
+
+        let output = CLIRenderer.renderText(
+            provider: .zai,
+            snapshot: snapshot,
+            credits: nil,
+            context: RenderContext(
+                header: "z.ai",
+                status: nil,
+                useColor: false,
+                resetStyle: .countdown),
+            now: now)
+        #expect(output.split(separator: "\n").count(where: { $0.contains("Pace: On pace") }) == 2)
+    }
+
+    @Test
+    func `zai CLI pace rejects a rolling 30-day coding limit`() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 50,
+                windowMinutes: ProviderPaceCapability.monthlyWindowSentinelMinutes,
+                resetsAt: now.addingTimeInterval(15 * 24 * 60 * 60),
+                resetDescription: "30 days window"),
+            secondary: nil,
+            tertiary: nil,
+            updatedAt: now)
+
+        #expect(CLIRenderer.providerPacePayload(provider: .zai, snapshot: snapshot, now: now) == nil)
+
+        let output = CLIRenderer.renderText(
+            provider: .zai,
+            snapshot: snapshot,
+            credits: nil,
+            context: RenderContext(
+                header: "z.ai",
+                status: nil,
+                useColor: false,
+                resetStyle: .countdown),
+            now: now)
+        #expect(!output.contains("Pace:"))
+    }
+
+    @Test
+    func `Kimi CLI pace rejects missing and unsupported window durations`() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        for duration: Int? in [nil, 24 * 60, 30 * 24 * 60] {
+            let window = RateWindow(
+                usedPercent: 25,
+                windowMinutes: duration,
+                resetsAt: now.addingTimeInterval(60 * 60),
+                resetDescription: nil)
+            let snapshots = [
+                UsageSnapshot(
+                    primary: window,
+                    secondary: nil,
+                    tertiary: nil,
+                    updatedAt: now),
+                UsageSnapshot(
+                    primary: nil,
+                    secondary: window,
+                    tertiary: nil,
+                    updatedAt: now),
+            ]
+
+            for snapshot in snapshots {
+                #expect(CLIRenderer.providerPacePayload(provider: .kimi, snapshot: snapshot, now: now) == nil)
+            }
+        }
+    }
+
+    @Test
+    func `descriptor reset window capability enables CLI pace`() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 30,
+                windowMinutes: nil,
+                resetsAt: now.addingTimeInterval(4 * 24 * 60 * 60),
+                resetDescription: "weekly"),
+            secondary: nil,
+            tertiary: nil,
+            updatedAt: now)
+
+        let pace = try #require(CLIRenderer.providerPacePayload(provider: .grok, snapshot: snapshot, now: now))
+        let primary = try #require(pace.primary)
+        #expect(primary.expectedUsedPercent == 43)
+        #expect(primary.summary == "13% in reserve | Expected 43% used | Lasts until reset")
+    }
+
+    @Test
+    func `descriptor monthly CLI pace uses the calendar cycle`() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let resetsAt = try #require(calendar.date(from: DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 3,
+            day: 1)))
+        let now = try #require(calendar.date(from: DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 2,
+            day: 15)))
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 40,
+                windowMinutes: ProviderPaceCapability.monthlyWindowSentinelMinutes,
+                resetsAt: resetsAt,
+                resetDescription: "monthly"),
+            secondary: nil,
+            tertiary: nil,
+            updatedAt: now)
+
+        let pace = try #require(CLIRenderer.providerPacePayload(provider: .amp, snapshot: snapshot, now: now))
+        #expect(pace.primary?.expectedUsedPercent == 50)
+    }
+
+    @Test
+    func `descriptor monthly CLI pace includes tertiary text and JSON`() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let resetsAt = try #require(calendar.date(from: DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 3,
+            day: 1)))
+        let now = try #require(calendar.date(from: DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 2,
+            day: 15)))
+        let snapshot = UsageSnapshot(
+            primary: nil,
+            secondary: nil,
+            tertiary: .init(
+                usedPercent: 40,
+                windowMinutes: ProviderPaceCapability.monthlyWindowSentinelMinutes,
+                resetsAt: resetsAt,
+                resetDescription: "monthly"),
+            updatedAt: now)
+
+        for provider: UsageProvider in [.alibaba, .opencodego] {
+            let pace = try #require(CLIRenderer.providerPacePayload(
+                provider: provider,
+                snapshot: snapshot,
+                now: now))
+            #expect(pace.primary == nil)
+            #expect(pace.secondary == nil)
+            #expect(pace.tertiary?.expectedUsedPercent == 50)
+
+            let output = CLIRenderer.renderText(
+                provider: provider,
+                snapshot: snapshot,
+                credits: nil,
+                context: RenderContext(
+                    header: provider.rawValue,
+                    status: nil,
+                    useColor: false,
+                    resetStyle: .countdown),
+                now: now)
+            #expect(output.contains("Monthly: 60% left"))
+            #expect(output.contains("Pace: 10% in reserve | Expected 50% used | Lasts until reset"))
+
+            let data = try JSONEncoder().encode(pace)
+            let encoded = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+            #expect(encoded["primary"] == nil)
+            #expect(encoded["secondary"] == nil)
+            #expect(encoded["tertiary"] != nil)
+        }
+    }
+
+    @Test
     func `renders Ollama weekly pace line when weekly window has reset`() {
         let now = Date()
         let snap = UsageSnapshot(
@@ -756,11 +1030,11 @@ struct CLISnapshotTests {
             updatedAt: now)
 
         let output = CLIRenderer.renderText(
-            provider: .zai,
+            provider: .deepseek,
             snapshot: snap,
             credits: nil,
             context: RenderContext(
-                header: "z.ai 0.0.0 (zai)",
+                header: "DeepSeek 0.0.0 (deepseek)",
                 status: nil,
                 useColor: false,
                 resetStyle: .countdown))
@@ -820,7 +1094,8 @@ struct CLISnapshotTests {
             credits: nil,
             antigravityPlanInfo: nil,
             openaiDashboard: nil,
-            error: nil)
+            error: nil,
+            diagnostic: "Grok team usage is unavailable from the current billing surface.")
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         let data = try encoder.encode(payload)
@@ -833,6 +1108,7 @@ struct CLISnapshotTests {
         #expect(json.contains("\"version\":\"1.2.3\""))
         #expect(json.contains("\"status\""))
         #expect(json.contains("status.example.com"))
+        #expect(json.contains("Grok team usage is unavailable from the current billing surface."))
         #expect(json.contains("\"primary\""))
         #expect(json.contains("\"windowMinutes\":300"))
         #expect(json.contains("1700000000"))
@@ -945,19 +1221,19 @@ struct CLISnapshotTests {
             tertiary: nil,
             updatedAt: now)
 
-        // z.ai is not a session/weekly pace provider, so no pace should be emitted.
+        // DeepSeek has no descriptor pace capability, so no pace should be emitted.
         let payload = ProviderPayload(
-            provider: .zai,
+            provider: .deepseek,
             account: nil,
             version: nil,
-            source: "zai",
+            source: "deepseek",
             status: nil,
             usage: snap,
             credits: nil,
             antigravityPlanInfo: nil,
             openaiDashboard: nil,
             error: nil,
-            pace: CLIRenderer.providerPacePayload(provider: .zai, snapshot: snap, now: now))
+            pace: CLIRenderer.providerPacePayload(provider: .deepseek, snapshot: snap, now: now))
 
         let data = try JSONEncoder().encode(payload)
         let json = try #require(String(data: data, encoding: .utf8))
@@ -1140,11 +1416,17 @@ struct CLISnapshotTests {
     }
 
     @Test
-    func `renders 5-hour tertiary row for zai`() {
+    func `renders GLM coding windows with MCP separate`() {
         let snap = UsageSnapshot(
-            primary: .init(usedPercent: 9, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            secondary: .init(usedPercent: 50, windowMinutes: nil, resetsAt: nil, resetDescription: nil),
-            tertiary: .init(usedPercent: 25, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
+            primary: .init(usedPercent: 25, windowMinutes: 300, resetsAt: nil, resetDescription: "5-hour"),
+            secondary: .init(usedPercent: 9, windowMinutes: 10080, resetsAt: nil, resetDescription: "1 week window"),
+            tertiary: nil,
+            extraRateWindows: [
+                NamedRateWindow(
+                    id: "zai-mcp",
+                    title: "MCP",
+                    window: .init(usedPercent: 50, windowMinutes: nil, resetsAt: nil, resetDescription: "MCP")),
+            ],
             updatedAt: Date(timeIntervalSince1970: 0))
 
         let output = CLIRenderer.renderText(
@@ -1158,7 +1440,7 @@ struct CLISnapshotTests {
                 resetStyle: .absolute))
 
         #expect(output.contains("5-hour:"))
-        #expect(output.contains("Tokens:"))
+        #expect(output.contains("Weekly:"))
         #expect(output.contains("MCP:"))
     }
 

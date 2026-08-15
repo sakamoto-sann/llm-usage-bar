@@ -22,19 +22,28 @@ extension UsageMenuCardView.Model {
         let usageBarsShowUsed: Bool
         let resetTimeDisplayStyle: ResetTimeDisplayStyle
         let tokenCostUsageEnabled: Bool
+        let tokenCostIsRefreshing: Bool
+        let codexLocalSessionCostLedgerEnabled: Bool
         let tokenCostInlineDashboardEnabled: Bool
         let tokenCostMenuSectionEnabled: Bool
         let costComparisonPeriodsEnabled: Bool
         let showOptionalCreditsAndExtraUsage: Bool
+        let claudeDailyRoutinesUsageVisible: Bool
         let codexSparkUsageVisible: Bool
         let copilotBudgetExtrasEnabled: Bool
+        /// Provider details is the diagnostic surface and lists every usage lane a provider reports.
+        /// The menu and widgets stay curated and may drop lanes that carry no information.
+        let showsAllUsageLanes: Bool
         let sourceLabel: String?
+        let subtitleOverride: String?
         let kiloAutoMode: Bool
         let hidePersonalInfo: Bool
         let weeklyPace: UsagePace?
+        let sessionEquivalentForecast: SessionEquivalentForecast?
         let quotaWarningThresholds: [QuotaWarningWindow: [Int]]
         let workDaysPerWeek: Int?
         let usesLiveSubtitle: Bool
+        let preferredCurrencyCode: String
         let now: Date
 
         init(
@@ -57,19 +66,26 @@ extension UsageMenuCardView.Model {
             usageBarsShowUsed: Bool,
             resetTimeDisplayStyle: ResetTimeDisplayStyle,
             tokenCostUsageEnabled: Bool,
+            tokenCostIsRefreshing: Bool = false,
+            codexLocalSessionCostLedgerEnabled: Bool = false,
             tokenCostInlineDashboardEnabled: Bool? = nil,
             tokenCostMenuSectionEnabled: Bool? = nil,
             costComparisonPeriodsEnabled: Bool = false,
             showOptionalCreditsAndExtraUsage: Bool,
+            claudeDailyRoutinesUsageVisible: Bool = true,
             codexSparkUsageVisible: Bool = true,
             copilotBudgetExtrasEnabled: Bool = false,
+            showsAllUsageLanes: Bool = false,
             sourceLabel: String? = nil,
+            subtitleOverride: String? = nil,
             kiloAutoMode: Bool = false,
             hidePersonalInfo: Bool,
             weeklyPace: UsagePace? = nil,
+            sessionEquivalentForecast: SessionEquivalentForecast? = nil,
             quotaWarningThresholds: [QuotaWarningWindow: [Int]] = [:],
             workDaysPerWeek: Int? = nil,
             usesLiveSubtitle: Bool = false,
+            preferredCurrencyCode: String = "auto",
             now: Date)
         {
             self.provider = provider
@@ -91,19 +107,26 @@ extension UsageMenuCardView.Model {
             self.usageBarsShowUsed = usageBarsShowUsed
             self.resetTimeDisplayStyle = resetTimeDisplayStyle
             self.tokenCostUsageEnabled = tokenCostUsageEnabled
+            self.tokenCostIsRefreshing = tokenCostIsRefreshing
+            self.codexLocalSessionCostLedgerEnabled = codexLocalSessionCostLedgerEnabled
             self.tokenCostInlineDashboardEnabled = tokenCostInlineDashboardEnabled ?? tokenCostUsageEnabled
             self.tokenCostMenuSectionEnabled = tokenCostMenuSectionEnabled ?? tokenCostUsageEnabled
             self.costComparisonPeriodsEnabled = costComparisonPeriodsEnabled
             self.showOptionalCreditsAndExtraUsage = showOptionalCreditsAndExtraUsage
+            self.claudeDailyRoutinesUsageVisible = claudeDailyRoutinesUsageVisible
             self.codexSparkUsageVisible = codexSparkUsageVisible
             self.copilotBudgetExtrasEnabled = copilotBudgetExtrasEnabled
+            self.showsAllUsageLanes = showsAllUsageLanes
             self.sourceLabel = sourceLabel
+            self.subtitleOverride = subtitleOverride
             self.kiloAutoMode = kiloAutoMode
             self.hidePersonalInfo = hidePersonalInfo
             self.weeklyPace = weeklyPace
+            self.sessionEquivalentForecast = sessionEquivalentForecast
             self.quotaWarningThresholds = quotaWarningThresholds
             self.workDaysPerWeek = workDaysPerWeek
             self.usesLiveSubtitle = usesLiveSubtitle
+            self.preferredCurrencyCode = preferredCurrencyCode
             self.now = now
         }
     }

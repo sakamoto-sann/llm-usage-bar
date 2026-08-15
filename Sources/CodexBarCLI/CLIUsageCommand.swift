@@ -5,7 +5,7 @@ import Foundation
 struct UsageCommandContext {
     let format: OutputFormat
     let includeCredits: Bool
-    let sourceModeOverride: ProviderSourceMode?
+    var sourceModeOverride: ProviderSourceMode?
     let antigravityPlanDebug: Bool
     let augmentDebug: Bool
     let webDebugDumpHTML: Bool
@@ -19,6 +19,8 @@ struct UsageCommandContext {
     let fetcher: UsageFetcher
     let claudeFetcher: ClaudeUsageFetcher
     let browserDetection: BrowserDetection
+    /// A verifier-only route that invokes the same app provider pipeline while retaining CLI JSON output.
+    var providerRuntime: ProviderRuntime = .cli
     /// True for long-lived hosts (`codexbar serve`) that keep warm provider
     /// helper sessions (such as the managed Antigravity `agy` process) alive
     /// between fetches instead of resetting after each one-shot fetch.
@@ -48,6 +50,7 @@ private struct UsageSuccessRenderInput {
     let dashboard: OpenAIDashboardSnapshot?
     let effectiveSourceMode: ProviderSourceMode
     let command: UsageCommandContext
+    let diagnostic: String?
     let notes: [String]
 }
 
@@ -80,8 +83,9 @@ extension CodexBarCLI {
                 output: output,
                 kind: .args)
         }
-        let antigravityPlanDebug = values.flags.contains("antigravityPlanDebug")
-        let augmentDebug = values.flags.contains("augmentDebug")
+        let antigravityPlanDebug = values.flags.contains("antigravityPlanDebug"),
+            augmentDebug = values.flags.contains("augmentDebug")
+        let appAutoVerifier = values.flags.contains("appAutoVerifier")
         let webDebugDumpHTML = values.flags.contains("webDebugDumpHtml")
         let webTimeout: TimeInterval
         do {
@@ -89,8 +93,7 @@ extension CodexBarCLI {
         } catch {
             Self.exit(code: .failure, message: "Error: \(error.localizedDescription)", output: output, kind: .args)
         }
-        let verbose = values.flags.contains("verbose")
-        let noColor = values.flags.contains("noColor")
+        let verbose = values.flags.contains("verbose"), noColor = values.flags.contains("noColor")
         let useColor = Self.shouldUseColor(noColor: noColor, format: format)
         let resetStyle = Self.resetTimeDisplayStyleFromDefaults()
         let weeklyWorkDays = Self.weeklyProgressWorkDaysFromDefaults()
@@ -111,6 +114,19 @@ extension CodexBarCLI {
                 kind: .args)
         }
 
+        if let message = Self.appAutoVerifierArgumentError(
+            enabled: appAutoVerifier,
+            providers: providerList,
+            sourceMode: parsedSourceMode,
+            tokenSelection: tokenSelection)
+        {
+            Self.exit(
+                code: .failure,
+                message: "Error: \(message)",
+                output: output,
+                kind: .args)
+        }
+
         if tokenSelection.usesOverride {
             guard providerList.count == 1 else {
                 Self.exit(
@@ -119,6 +135,7 @@ extension CodexBarCLI {
                     output: output,
                     kind: .args)
             }
+            // Provider-specific by design: Codex exposes reconciled accounts beyond config token accounts.
             let supportsAllCodexAccounts = providerList[0] == .codex
                 && tokenSelection.allAccounts
                 && tokenSelection.label == nil
@@ -140,7 +157,8 @@ extension CodexBarCLI {
             tokenContext = try TokenAccountCLIContext(
                 selection: tokenSelection,
                 config: config,
-                verbose: verbose)
+                verbose: verbose,
+                resolutionScope: appAutoVerifier ? .ambientAccount : .configuredAccounts)
         } catch {
             Self.exit(code: .failure, message: "Error: \(error.localizedDescription)", output: output, kind: .config)
         }
@@ -164,10 +182,31 @@ extension CodexBarCLI {
             includeAllCodexAccounts: tokenSelection.allAccounts && providerList == [.codex],
             fetcher: fetcher,
             claudeFetcher: claudeFetcher,
-            browserDetection: browserDetection)
+            browserDetection: browserDetection,
+            providerRuntime: appAutoVerifier ? .app : .cli)
 
         for p in providerList {
             let status = includeStatus ? await Self.fetchStatus(for: p) : nil
+            if appAutoVerifier {
+                // Background app Auto intentionally launches the opaque Claude owner CLI only after a successful
+                // user-initiated fetch has established this process's account-scoped availability marker. Recreate
+                // that real app lifecycle before exercising the background route; discard the foreground payload.
+                var establishmentCommand = command
+                establishmentCommand.sourceModeOverride = .cli
+                let establishment = await ProviderInteractionContext.$current.withValue(.userInitiated) {
+                    await Self.fetchUsageOutputs(
+                        provider: p,
+                        status: status,
+                        tokenContext: tokenContext,
+                        command: establishmentCommand)
+                }
+                if establishment.exitCode != .success {
+                    exitCode = establishment.exitCode
+                    sections.append(contentsOf: establishment.sections)
+                    payload.append(contentsOf: establishment.payload)
+                    continue
+                }
+            }
             // CLI usage should not clear Keychain cooldowns or attempt interactive Keychain prompts.
             let output = await ProviderInteractionContext.$current.withValue(.background) {
                 await Self.fetchUsageOutputs(
@@ -195,12 +234,30 @@ extension CodexBarCLI {
         Self.exit(code: exitCode, output: output, kind: exitCode == .success ? .runtime : .provider)
     }
 
+    static func appAutoVerifierArgumentError(
+        enabled: Bool,
+        providers: [UsageProvider],
+        sourceMode: ProviderSourceMode?,
+        tokenSelection: TokenAccountCLISelection) -> String?
+    {
+        guard enabled else { return nil }
+        // Provider-specific by design: this hidden verifier recreates Claude's owner-CLI lifecycle only.
+        guard providers == [.claude], sourceMode == .auto else {
+            return "--app-auto-verifier requires --provider claude --source auto."
+        }
+        guard !tokenSelection.usesOverride else {
+            return "--app-auto-verifier does not accept token-account selection."
+        }
+        return nil
+    }
+
     static func fetchUsageOutputs(
         provider: UsageProvider,
         status: ProviderStatusPayload?,
         tokenContext: TokenAccountCLIContext,
         command: UsageCommandContext) async -> UsageCommandOutput
     {
+        // Provider-specific by design: Codex can enumerate reconciled live, managed, and profile-home accounts.
         if provider == .codex, command.includeAllCodexAccounts {
             var output = UsageCommandOutput()
             let accounts = tokenContext.visibleCodexAccounts().visibleAccounts
@@ -231,7 +288,16 @@ extension CodexBarCLI {
 
         let selections = Self.accountSelections(from: accounts)
         var output = UsageCommandOutput()
-        for account in selections {
+        let accountRefreshDelay = TokenAccountSupportCatalog
+            .support(for: provider)?.minimumDelayBetweenAccountRefreshes
+        for (index, account) in selections.enumerated() {
+            if index > 0, let accountRefreshDelay {
+                do {
+                    try await Task.sleep(for: accountRefreshDelay)
+                } catch {
+                    return output
+                }
+            }
             let result = await Self.fetchUsageOutput(
                 provider: provider,
                 account: account,
@@ -244,7 +310,9 @@ extension CodexBarCLI {
     }
 
     private static func accountSelections(from accounts: [ProviderTokenAccount]) -> [ProviderTokenAccount?] {
-        if accounts.isEmpty { return [nil] }
+        if accounts.isEmpty {
+            return [nil]
+        }
         return accounts.map { Optional($0) }
     }
 
@@ -287,6 +355,7 @@ extension CodexBarCLI {
         credits: CreditsSnapshot?,
         antigravityPlanInfo: AntigravityPlanInfoSummary?,
         dashboard: OpenAIDashboardSnapshot?,
+        diagnostic: String?,
         weeklyWorkDays: Int?) -> ProviderPayload
     {
         ProviderPayload(
@@ -301,6 +370,7 @@ extension CodexBarCLI {
             antigravityPlanInfo: antigravityPlanInfo,
             openaiDashboard: dashboard,
             error: nil,
+            diagnostic: diagnostic,
             pace: CLIRenderer.providerPacePayload(provider: provider, snapshot: usage, weeklyWorkDays: weeklyWorkDays))
     }
 
@@ -337,6 +407,7 @@ extension CodexBarCLI {
                         resetStyle: input.command.resetStyle,
                         weeklyWorkDays: input.command.weeklyWorkDays,
                         notes: input.notes))
+                // Provider-specific by design: OpenAI dashboard payloads are behavioral Codex fetch results.
                 if let dashboard = input.dashboard, input.provider == .codex, input.effectiveSourceMode.usesWeb {
                     text += "\n" + Self.renderOpenAIWebDashboardText(dashboard)
                 }
@@ -354,6 +425,7 @@ extension CodexBarCLI {
                 credits: input.credits,
                 antigravityPlanInfo: input.antigravityPlanInfo,
                 dashboard: input.dashboard,
+                diagnostic: input.diagnostic,
                 weeklyWorkDays: input.command.weeklyWorkDays))
         }
     }
@@ -406,9 +478,10 @@ extension CodexBarCLI {
         #endif
 
         let fetchContext = ProviderFetchContext(
-            runtime: .cli,
+            runtime: command.providerRuntime,
             sourceMode: effectiveSourceMode,
             includeCredits: command.includeCredits,
+            requiresOptionalUsageCompleteness: true,
             webTimeout: command.webTimeout,
             webDebugDumpHTML: command.webDebugDumpHTML,
             verbose: command.verbose,
@@ -442,6 +515,7 @@ extension CodexBarCLI {
             }
 
             var dashboard = result.dashboard
+            // Provider-specific by design: JSON preserves Codex's optional behavioral dashboard payload.
             if dashboard == nil, command.format == .json, provider == .codex {
                 dashboard = Self.loadOpenAIDashboardIfAvailable(
                     usage: usage,
@@ -458,7 +532,7 @@ extension CodexBarCLI {
             let notes = Self.usageTextNotes(
                 provider: provider,
                 sourceMode: effectiveSourceMode,
-                resolvedSourceLabel: source)
+                resolvedSourceLabel: source) + (result.diagnostic.map { [$0] } ?? [])
 
             Self.appendSuccessRenderOutput(
                 UsageSuccessRenderInput(
@@ -474,6 +548,7 @@ extension CodexBarCLI {
                     dashboard: dashboard,
                     effectiveSourceMode: effectiveSourceMode,
                     command: command,
+                    diagnostic: result.diagnostic,
                     notes: notes),
                 output: &output)
         case let .failure(error):
@@ -516,6 +591,7 @@ extension CodexBarCLI {
         let descriptor = ProviderDescriptorRegistry.descriptor(for: provider)
         guard descriptor.cli.versionDetector != nil else { return false }
         guard result.strategyKind != .webDashboard else { return false }
+        // Provider-specific by design: Claude OAuth is in-process and has no CLI version to report.
         return !(provider == .claude && result.strategyKind == .oauth)
     }
 
@@ -543,6 +619,7 @@ extension CodexBarCLI {
         jsonOnly: Bool,
         persistsCLISessions: Bool) -> Bool
     {
+        // Provider-specific by design: --antigravity-plan-debug interrogates its persistent helper session.
         provider == .antigravity
             && planDebugEnabled
             && !jsonOnly
@@ -564,6 +641,7 @@ extension CodexBarCLI {
         provider: UsageProvider,
         command: UsageCommandContext) async -> AntigravityPlanInfoSummary?
     {
+        // Provider-specific by design: --antigravity-plan-debug requests its plan-only diagnostic.
         guard command.antigravityPlanDebug,
               provider == .antigravity,
               !command.jsonOnly
@@ -581,6 +659,7 @@ extension CodexBarCLI {
         provider: UsageProvider,
         command: UsageCommandContext) async
     {
+        // Provider-specific by design: --augment-debug emits Augment's explicit diagnostic dump.
         guard command.augmentDebug, provider == .augment else { return }
         #if os(macOS)
         let dump = await AugmentStatusProbe.latestDumps()
@@ -660,65 +739,11 @@ extension CodexBarCLI {
         environment: [String: String]? = nil,
         settings: ProviderSettingsSnapshot? = nil) -> Bool
     {
-        guard provider != .grok, provider != .amp else {
-            return false
-        }
-        if provider == .codex, sourceMode == .auto {
-            return false
-        }
-        if provider == .claude, sourceMode == .auto {
-            // Claude's cross-platform planner skips its unavailable web step and falls back to the CLI.
-            return false
-        }
-        if provider == .opencodego {
-            if sourceMode == .auto || settings?.opencodego?.cookieSource == .manual {
-                return false
-            }
-        }
-        if provider == .commandcode,
-           settings?.commandcode?.cookieSource == .manual
-        {
-            return false
-        }
-        #if os(Linux)
-        if provider == .cursor,
-           settings?.cursor?.cookieSource != .off
-        {
-            // Linux uses Cursor app auth and manual cookies; browser import remains macOS-only.
-            return false
-        }
-        #endif
-        if provider == .sakana,
-           sourceMode == .auto || sourceMode == .web,
-           environment.map({ SakanaSettingsReader.cookieHeader(environment: $0) != nil }) == true
-        {
-            return false
-        }
-        if provider == .qoder,
-           settings?.qoder?.cookieSource == .manual
-        {
-            return false
-        }
-        if provider == .ollama,
-           sourceMode == .auto
-        {
-            let hasEnvironmentToken = environment.map {
-                ProviderTokenResolver.ollamaToken(environment: $0) != nil
-            } == true
-            if settings?.ollama?.cookieSource == .off || hasEnvironmentToken {
-                return false
-            }
-        }
-        if provider == .kimi,
-           sourceMode == .auto,
-           environment.map({ ProviderTokenResolver.kimiAPIToken(environment: $0) != nil }) == true
-        {
-            return false
-        }
-        if provider == .mimo,
-           sourceMode == .auto,
-           let environment,
-           MiMoLocalUsageFallback.cacheExists(environment: environment)
+        let descriptor = ProviderDescriptorRegistry.descriptor(for: provider)
+        if descriptor.cli.isBrowserSupportExempt(
+            sourceMode: sourceMode,
+            environment: environment,
+            settings: settings)
         {
             return false
         }
@@ -726,7 +751,7 @@ extension CodexBarCLI {
         case .web:
             true
         case .auto:
-            ProviderDescriptorRegistry.descriptor(for: provider).fetchPlan.sourceModes.contains(.web)
+            descriptor.fetchPlan.sourceModes.contains(.web)
         case .cli, .oauth, .api:
             false
         }

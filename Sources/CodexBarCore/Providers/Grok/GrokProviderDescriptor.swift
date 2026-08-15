@@ -1,7 +1,17 @@
 import Foundation
+import SweetCookieKit
 
 public enum GrokProviderDescriptor {
     public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
+    /// Grok is normally signed in through Chrome; avoid touching unrelated browser keychains.
+    private static var browserCookieOrder: BrowserCookieImportOrder? {
+        #if os(macOS)
+        [.chrome]
+        #else
+        nil
+        #endif
+    }
 
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
@@ -18,26 +28,51 @@ public enum GrokProviderDescriptor {
                 toggleTitle: "Show Grok usage",
                 cliName: "grok",
                 defaultEnabled: false,
+                widgetSelectable: false,
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
-                browserCookieOrder: ProviderBrowserCookieDefaults.grokCookieImportOrder,
+                debugLogUnavailableMessage: "Grok debug log not yet implemented",
+                browserCookieOrder: self.browserCookieOrder,
                 dashboardURL: "https://grok.com/?_s=usage",
                 changelogURL: "https://x.ai/news",
                 statusPageURL: nil,
                 statusLinkURL: "https://status.x.ai"),
             branding: ProviderBranding(
-                iconStyle: .grok,
+                iconStyle: .init(provider: .grok),
                 iconResourceName: "ProviderIcon-grok",
-                color: ProviderColor(red: 16 / 255, green: 163 / 255, blue: 127 / 255)),
+                color: ProviderColor(red: 16 / 255, green: 163 / 255, blue: 127 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x000000),
+                    ProviderColor(hex: 0x868686),
+                    ProviderColor(hex: 0xFDFDFD),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Grok cost summary is not supported yet." }),
+            pace: ProviderPaceCapability(resetWindowPace: .custom { window, now in
+                guard Self.primaryLabel(window: window, now: now) == "Weekly",
+                      let resetsAt = window.resetsAt
+                else { return false }
+                let windowMinutes = window.windowMinutes ?? 7 * 24 * 60
+                let timeUntilReset = resetsAt.timeIntervalSince(now)
+                return windowMinutes > 0
+                    && timeUntilReset > 0
+                    && timeUntilReset <= TimeInterval(windowMinutes) * 60
+            }),
+            presentation: ProviderUsagePresentation(rateWindowLabeler: { metadata, snapshot, now in
+                ProviderRateWindowLabels(
+                    primary: Self.displayLabel(window: snapshot.primary, now: now) ?? metadata.sessionLabel,
+                    secondary: metadata.weeklyLabel,
+                    tertiary: metadata.opusLabel ?? "Sonnet",
+                    showsTertiary: metadata.supportsOpus)
+            }),
             fetchPlan: ProviderFetchPlan(
                 sourceModes: [.auto, .cli, .web],
                 pipeline: ProviderFetchPipeline(resolveStrategies: self.resolveStrategies)),
             cli: ProviderCLIConfig(
                 name: "grok",
-                versionDetector: { _ in GrokStatusProbe.detectVersion() }))
+                versionDetector: { _ in GrokStatusProbe.detectVersion() },
+                browserSupportExemption: { _, _, _ in true }))
     }
 
     private static func resolveStrategies(context: ProviderFetchContext) async -> [any ProviderFetchStrategy] {
@@ -68,11 +103,26 @@ public enum GrokProviderDescriptor {
         return self.primaryLabel(duration: resetsAt.timeIntervalSince(now))
     }
 
+    /// Grok's current untyped credits surface is the weekly credit pool (#2929). Keep explicit
+    /// durations authoritative, but do not lose the weekly label near the end of an untyped window.
+    public static func displayLabel(window: RateWindow?, now: Date = .now) -> String? {
+        guard let window else { return nil }
+        if let label = self.primaryLabel(window: window, now: now) {
+            return label
+        }
+        guard window.windowMinutes == nil, window.resetsAt != nil else { return nil }
+        return "Weekly"
+    }
+
     private static func primaryLabel(duration seconds: TimeInterval) -> String? {
         guard seconds > 3600 else { return nil }
         let days = Int((seconds / 86400).rounded(.toNearestOrAwayFromZero))
-        if (4...12).contains(days) { return "Weekly" }
-        if (20...45).contains(days) { return "Monthly" }
+        if (4...12).contains(days) {
+            return "Weekly"
+        }
+        if (20...45).contains(days) {
+            return "Monthly"
+        }
         return nil
     }
 }
@@ -90,7 +140,8 @@ struct GrokCLIFetchStrategy: ProviderFetchStrategy {
         let snap = try await probe.fetch(env: context.env)
         return self.makeResult(
             usage: snap.toUsageSnapshot(),
-            sourceLabel: "grok-cli")
+            sourceLabel: "grok-cli",
+            diagnostic: snap.diagnostic)
     }
 
     func shouldFallback(on _: Error, context: ProviderFetchContext) -> Bool {
@@ -101,13 +152,27 @@ struct GrokCLIFetchStrategy: ProviderFetchStrategy {
 struct GrokWebFetchStrategy: ProviderFetchStrategy {
     let id: String = "grok.web"
     let kind: ProviderFetchKind = .web
+    typealias ProxyBillingFetch = @Sendable (GrokCredentials) async throws -> GrokWebBillingSnapshot
+    typealias WebBillingFetch = @Sendable () async throws -> (
+        snapshot: GrokWebBillingSnapshot,
+        sourceLabel: String,
+        authenticatedByAuthFile: Bool)
 
+    /// Browser-cookie import must stay limited to surfaces where a person explicitly asked for it:
+    /// the menu-bar app runtime, a `userInitiated` interaction (set only by explicit refresh
+    /// commands and app UI gestures), or the environment override. Scheduled and background work
+    /// must keep the default `.background` context so it can never reach Chromium Keychain prompts.
     static func canImportBrowserCookies(runtime: ProviderRuntime, env: [String: String]) -> Bool {
-        runtime == .app || env["CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT"] == "1"
+        runtime == .app ||
+            ProviderInteractionContext.current == .userInitiated ||
+            env["CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT"] == "1"
     }
 
     func isAvailable(_ context: ProviderFetchContext) async -> Bool {
         #if os(macOS)
+        if CookieHeaderCache.load(provider: .grok) != nil {
+            return true
+        }
         if Self.canImportBrowserCookies(runtime: context.runtime, env: context.env),
            GrokCookieImporter.hasSession(browserDetection: context.browserDetection)
         {
@@ -118,7 +183,36 @@ struct GrokWebFetchStrategy: ProviderFetchStrategy {
     }
 
     func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
-        let (webBilling, sourceLabel, authenticatedByAuthFile) = try await self.fetchWebBilling(context: context)
+        try await self.fetch(context, webBilling: { [self] in
+            try await self.fetchWebBilling(context: context)
+        })
+    }
+
+    func fetch(
+        _ context: ProviderFetchContext,
+        webBilling fetchWebBilling: @escaping WebBillingFetch) async throws -> ProviderFetchResult
+    {
+        let webBilling: GrokWebBillingSnapshot
+        let sourceLabel: String
+        let authenticatedByAuthFile: Bool
+        do {
+            (webBilling, sourceLabel, authenticatedByAuthFile) = try await fetchWebBilling()
+        } catch GrokWebBillingError.teamUsageUnsupported {
+            guard let authState = try? GrokCredentialsStore.load(env: context.env),
+                  !authState.isExpired,
+                  authState.isTeamPrincipal
+            else {
+                throw GrokWebBillingError.teamUsageUnsupported
+            }
+            let identitySnapshot = GrokStatusProbe.identityOnlySnapshot(
+                credentials: authState,
+                localSummary: GrokLocalSessionScanner.summarize(env: context.env),
+                cliVersion: GrokStatusProbe.detectVersion(env: context.env))
+            return self.makeResult(
+                usage: identitySnapshot.toUsageSnapshot(),
+                sourceLabel: "grok-web",
+                diagnostic: identitySnapshot.diagnostic)
+        }
         let credentials = Self.credentialsForWebBillingSnapshot(
             credentials: try? GrokCredentialsStore.load(env: context.env),
             authenticatedByAuthFile: authenticatedByAuthFile)
@@ -137,24 +231,90 @@ struct GrokWebFetchStrategy: ProviderFetchStrategy {
             sourceLabel: sourceLabel)
     }
 
-    private func fetchWebBilling(context: ProviderFetchContext) async throws -> (
-        snapshot: GrokWebBillingSnapshot,
-        sourceLabel: String,
-        authenticatedByAuthFile: Bool)
+    func fetchWebBilling(
+        context: ProviderFetchContext,
+        proxyBilling: ProxyBillingFetch = { try await GrokCreditsProxyFetcher.fetch(credentials: $0) }) async throws
+        -> (
+            snapshot: GrokWebBillingSnapshot,
+            sourceLabel: String,
+            authenticatedByAuthFile: Bool)
     {
         let credentialsResult: Result<GrokCredentials, Error> = Result {
             try GrokCredentialsStore.load(env: context.env)
         }
         let browserCredentials = try? credentialsResult.get()
 
+        return try await Self.fetchProxyFirst(
+            credentials: browserCredentials,
+            proxyBilling: proxyBilling)
+        { [self] in
+            try await self.fetchLegacyWebBilling(
+                context: context,
+                credentialsResult: credentialsResult,
+                browserCredentials: browserCredentials)
+        }
+    }
+
+    static func fetchProxyFirst(
+        credentials: GrokCredentials?,
+        proxyBilling: ProxyBillingFetch,
+        legacyBilling: () async throws -> (
+            snapshot: GrokWebBillingSnapshot,
+            sourceLabel: String,
+            authenticatedByAuthFile: Bool)) async throws -> (
+        snapshot: GrokWebBillingSnapshot,
+        sourceLabel: String,
+        authenticatedByAuthFile: Bool)
+    {
+        if let credentials, !credentials.isExpired {
+            do {
+                let snapshot = try await proxyBilling(credentials)
+                return (snapshot, "grok-cli-proxy", true)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError where error.code == .cancelled {
+                throw error
+            } catch {
+                // The legacy cookie and bearer paths remain available when the CLI proxy fails.
+            }
+        }
+        return try await legacyBilling()
+    }
+
+    private func fetchLegacyWebBilling(
+        context: ProviderFetchContext,
+        credentialsResult: Result<GrokCredentials, Error>,
+        browserCredentials: GrokCredentials?) async throws -> (
+        snapshot: GrokWebBillingSnapshot,
+        sourceLabel: String,
+        authenticatedByAuthFile: Bool)
+    {
         #if os(macOS)
+        var cacheObservation = CookieHeaderCache.observeForConditionalMutation(provider: .grok)
+        var lastCookieError: Error?
+        if let cached = cacheObservation.entry {
+            do {
+                let snapshot = try await Self.fetchValidCookieHeader(
+                    cached.cookieHeader,
+                    credentials: browserCredentials,
+                    preferTrailingAuthenticationFailure: true)
+                return (snapshot, cached.sourceLabel, false)
+            } catch {
+                guard Self.isCookieAuthenticationFailure(error) else { throw error }
+                if CookieHeaderCache.clearIfCurrent(provider: .grok, expected: cached) {
+                    cacheObservation = cacheObservation.afterOwnedClear()
+                }
+                lastCookieError = error
+            }
+        }
+
         if Self.canImportBrowserCookies(runtime: context.runtime, env: context.env) {
-            var lastCookieError: Error?
             do {
                 let sessions = try GrokCookieImporter.importSessions(browserDetection: context.browserDetection)
                 let (snapshot, sourceLabel) = try await Self.fetchFirstValidCookieSession(
                     sessions,
-                    credentials: browserCredentials)
+                    credentials: browserCredentials,
+                    cacheObservation: cacheObservation)
                 return (snapshot, sourceLabel, false)
             } catch {
                 lastCookieError = error
@@ -189,6 +349,7 @@ struct GrokWebFetchStrategy: ProviderFetchStrategy {
     static func fetchFirstValidCookieSession(
         _ sessions: [GrokCookieImporter.SessionInfo],
         credentials: GrokCredentials? = nil,
+        cacheObservation: CookieHeaderCache.ConditionalMutationObservation? = nil,
         fetch: ((String, GrokCredentials?) async throws -> GrokWebBillingSnapshot)? = nil) async throws
         -> (GrokWebBillingSnapshot, String)
     {
@@ -198,14 +359,64 @@ struct GrokWebFetchStrategy: ProviderFetchStrategy {
                 credentials: credentials)
         }
         var lastError: Error?
+        var teamUsageUnsupportedError: Error?
         for session in sessions {
-            for authCredentials in Self.cookieAuthAttempts(credentials: credentials) {
-                do {
-                    let snapshot = try await fetchSnapshot(session.cookieHeader, authCredentials)
-                    return (snapshot, session.sourceLabel)
-                } catch {
-                    lastError = error
+            do {
+                let snapshot = try await Self.fetchValidCookieHeader(
+                    session.cookieHeader,
+                    credentials: credentials,
+                    fetch: fetchSnapshot)
+                if let cacheObservation {
+                    CookieHeaderCache.storeIfObservationCurrent(
+                        provider: .grok,
+                        expected: cacheObservation,
+                        cookieHeader: session.cookieHeader,
+                        sourceLabel: session.sourceLabel)
                 }
+                return (snapshot, session.sourceLabel)
+            } catch {
+                if case GrokWebBillingError.teamUsageUnsupported = error {
+                    teamUsageUnsupportedError = error
+                }
+                lastError = error
+            }
+        }
+        throw teamUsageUnsupportedError ?? lastError ?? GrokWebBillingError.missingCredentials
+    }
+
+    /// `preferTrailingAuthenticationFailure` lets a cached-cookie caller surface a trailing
+    /// 401/403 over the team classification so stale sessions still trigger cache eviction.
+    /// Non-authentication trailing errors keep `teamUsageUnsupported` so team principals
+    /// degrade to identity-only data instead of failing outright.
+    static func fetchValidCookieHeader(
+        _ cookieHeader: String,
+        credentials: GrokCredentials? = nil,
+        preferTrailingAuthenticationFailure: Bool = false,
+        fetch: ((String, GrokCredentials?) async throws -> GrokWebBillingSnapshot)? = nil) async throws
+        -> GrokWebBillingSnapshot
+    {
+        let fetchSnapshot = fetch ?? { cookieHeader, credentials in
+            try await GrokWebBillingFetcher.fetch(
+                cookieHeader: cookieHeader,
+                credentials: credentials)
+        }
+        var lastError: Error?
+        var teamUsageUnsupportedError: Error?
+        for authCredentials in Self.cookieAuthAttempts(credentials: credentials) {
+            do {
+                return try await fetchSnapshot(cookieHeader, authCredentials)
+            } catch {
+                if case GrokWebBillingError.teamUsageUnsupported = error {
+                    teamUsageUnsupportedError = error
+                }
+                lastError = error
+            }
+        }
+        if let teamUsageUnsupportedError {
+            let trailingAuthenticationFailure = preferTrailingAuthenticationFailure
+                && lastError.map(Self.isCookieAuthenticationFailure) == true
+            if !trailingAuthenticationFailure {
+                throw teamUsageUnsupportedError
             }
         }
         throw lastError ?? GrokWebBillingError.missingCredentials
@@ -214,6 +425,18 @@ struct GrokWebFetchStrategy: ProviderFetchStrategy {
     static func cookieAuthAttempts(credentials: GrokCredentials?) -> [GrokCredentials?] {
         guard let credentials, !credentials.isExpired else { return [nil] }
         return [credentials, nil]
+    }
+
+    static func isCookieAuthenticationFailure(_ error: Error) -> Bool {
+        guard let error = error as? GrokWebBillingError else { return false }
+        switch error {
+        case let .requestFailed(status, _):
+            return status == 401 || status == 403
+        case let .rpcFailed(status, message):
+            return GrokWebBillingError.isAuthenticationFailure(status: status, message: message)
+        case .missingCredentials, .emptyResponse, .invalidResponse, .teamUsageUnsupported, .parseFailed:
+            return false
+        }
     }
     #endif
 

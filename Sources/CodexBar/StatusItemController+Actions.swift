@@ -6,7 +6,7 @@ extension StatusItemController {
     /// of each other and of the all-providers refresh.
     enum ManualRefreshScope: Hashable {
         case global
-        case provider(UsageProvider)
+        case provider(ProviderInstanceID)
     }
 }
 
@@ -79,10 +79,17 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
             let refreshStartedAt = Date()
             await self.store.refreshProvider(provider)
             guard !Task.isCancelled, !self.hasPreparedForAppShutdown else { return }
+            // Provider-specific by design: Codex publishes a compatible core quota model before its optional
+            // credits and OpenAI Web enrichment stages below. Incompatible cards remain frozen until the final
+            // menu reconciliation, so they never lose their loading state while still showing the old layout.
+            if provider == .codex {
+                self.menuCardRefreshMonitor.publishResolvedModelIfCompatible(for: provider)
+            }
             await self.store.refreshProviderStatus(provider)
             guard !Task.isCancelled, !self.hasPreparedForAppShutdown else { return }
             await self.store.refreshTokenUsageNow(for: provider, force: true)
             guard !Task.isCancelled, !self.hasPreparedForAppShutdown else { return }
+            // Provider-specific by design: Codex refresh also owns OpenAI dashboard and reset-credit enrichment.
             if provider == .codex {
                 await self.store.refreshCreditsNow(minimumSnapshotUpdatedAt: refreshStartedAt)
                 guard !Task.isCancelled, !self.hasPreparedForAppShutdown else { return }
@@ -168,10 +175,11 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     }
 
     private func startManualRefresh(
-        for provider: UsageProvider?,
+        for provider: ProviderInstanceID?,
         originatingMenuID: ObjectIdentifier?,
         originatingMenuInteractionGeneration: Int?)
     {
+        let firstPartyProvider = provider?.firstPartyProvider
         let scope: ManualRefreshScope = provider.map(ManualRefreshScope.provider) ?? .global
         let scopedRefreshInFlight = provider.map { self.store.refreshingProviders.contains($0) }
             ?? !self.store.refreshingProviders.isEmpty
@@ -197,7 +205,7 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
             var completed = false
             defer {
                 self.manualRefreshTasks[scope] = nil
-                self.menuCardRefreshMonitor.endManualRefresh(for: provider)
+                self.menuCardRefreshMonitor.endManualRefresh(for: firstPartyProvider)
                 self.updatePersistentRefreshItemsEnabled()
                 if completed {
                     self.scheduleCompletedManualRefreshViewportRestore(viewportRestoreRequests)
@@ -216,7 +224,7 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
                 return
             }
             #endif
-            if let provider {
+            if let provider = firstPartyProvider {
                 await self.performStoreRefresh(
                     for: provider,
                     refreshOpenMenusWhenComplete: true,
@@ -231,16 +239,16 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
             completed = true
         }
         self.manualRefreshTasks[scope] = task
-        self.menuCardRefreshMonitor.beginManualRefresh(frozenModels: frozenModels, provider: provider)
+        self.menuCardRefreshMonitor.beginManualRefresh(frozenModels: frozenModels, provider: firstPartyProvider)
         self.updatePersistentRefreshItemsEnabled()
     }
 
-    private func manualRefreshProvider(for menu: NSMenu?) -> UsageProvider? {
+    private func manualRefreshProvider(for menu: NSMenu?) -> ProviderInstanceID? {
         guard let menu else { return nil }
         if self.shouldMergeIcons {
             guard self.mergedMenu == nil || menu === self.mergedMenu else { return nil }
             guard !self.isMergedOverviewSelected(in: menu) else { return nil }
-            return self.resolvedMenuProvider()
+            return self.resolvedMenuProvider()?.instanceID
         }
         return self.menuProviders[ObjectIdentifier(menu)]
     }
@@ -253,13 +261,14 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
             providers.append(lastMenuProvider)
         }
         if providers.isEmpty,
-           let defaultProvider = self.settings.orderedProviders().first ?? UsageProvider.allCases.first
+           let defaultProvider = self.settings.orderedFirstPartyProviders().first ?? UsageProvider.allCases.first
         {
-            providers.append(defaultProvider)
+            providers.append(defaultProvider.instanceID)
         }
 
         var models: [UsageProvider: UsageMenuCardView.Model] = [:]
-        for provider in providers {
+        for instanceID in providers {
+            guard let provider = instanceID.firstPartyProvider else { continue }
             models[provider] = self.menuCardModel(for: provider)
         }
         return models
@@ -322,8 +331,9 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     }
 
     @objc func openDashboard() {
-        let preferred = self.lastMenuProvider
-            ?? (self.store.isEnabled(.codex) ? .codex : self.store.enabledProviders().first)
+        // Provider-specific by design: Codex remains the historical action fallback when no provider is selected.
+        let preferred = self.lastMenuProvider?.firstPartyProvider
+            ?? (self.store.isEnabled(.codex) ? .codex : self.store.enabledFirstPartyProviders().first)
 
         let provider = preferred ?? .codex
         guard let url = self.dashboardURL(for: provider) else { return }
@@ -334,6 +344,7 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
         for provider: UsageProvider,
         environment: [String: String] = ProcessInfo.processInfo.environment) -> URL?
     {
+        // Provider-specific by design: these dashboards depend on region, source label, scope, or subscription plan.
         if provider == .alibaba {
             return self.settings.alibabaCodingPlanAPIRegion.dashboardURL
         }
@@ -357,7 +368,7 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
         }
 
         if provider == .zai {
-            return ZaiUsageFetcher.resolveDashboardURL(
+            return ZaiEndpointRouter.resolveDashboardURL(
                 region: self.settings.zaiAPIRegion,
                 environment: environment,
                 usageScope: self.settings.zaiEffectiveUsageScope())
@@ -381,6 +392,7 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     }
 
     @objc func openCreditsPurchase() {
+        // Provider-specific by design: codexResetCredits payload supplies the validated ChatGPT purchase URL.
         let preferred = self.lastMenuProvider
             ?? (self.store.isEnabled(.codex) ? .codex : self.store.enabledProviders().first)
         let provider = preferred ?? .codex
@@ -431,15 +443,15 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     }
 
     @objc func openStatusPage() {
-        let preferred = self.lastMenuProvider
-            ?? (self.store.isEnabled(.codex) ? .codex : self.store.enabledProviders().first)
+        let preferred = self.lastMenuProvider?.firstPartyProvider
+            ?? (self.store.isEnabled(.codex) ? .codex : self.store.enabledFirstPartyProviders().first)
 
         self.openStatusPage(for: preferred ?? .codex)
     }
 
     @objc func openStatusPageFromMenuItem(_ sender: NSMenuItem) {
         let provider = (sender.identifier?.rawValue).flatMap(UsageProvider.init(rawValue:))
-            ?? self.lastMenuProvider
+            ?? self.lastMenuProvider?.firstPartyProvider
             ?? .codex
         self.openStatusPage(for: provider)
     }
@@ -452,8 +464,8 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     }
 
     @objc func openChangelog() {
-        let preferred = self.lastMenuProvider
-            ?? (self.store.isEnabled(.codex) ? .codex : self.store.enabledProviders().first)
+        let preferred = self.lastMenuProvider?.firstPartyProvider
+            ?? (self.store.isEnabled(.codex) ? .codex : self.store.enabledFirstPartyProviders().first)
 
         let provider = preferred ?? .codex
         let meta = self.store.metadata(for: provider)
@@ -462,6 +474,7 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     }
 
     @objc func openTerminalCommand(_ sender: NSMenuItem) {
+        // Provider-specific by design: legacy terminal menu items without a command payload open Claude.
         let command = sender.representedObject as? String ?? "claude"
         self.openTerminal(command: command)
     }
@@ -523,7 +536,9 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
         }
 
         let rawProvider = sender.representedObject as? String
-        let provider = rawProvider.flatMap(UsageProvider.init(rawValue:)) ?? self.lastMenuProvider ?? .codex
+        let provider = rawProvider.flatMap(UsageProvider.init(rawValue:))
+            ?? self.lastMenuProvider?.firstPartyProvider
+            ?? .codex
         self.loginLogger.info("Switch Account tapped", metadata: ["provider": provider.rawValue])
         self.startLoginFlow(provider: provider)
     }
@@ -579,7 +594,7 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     func celebrationOriginPoint(for provider: UsageProvider?) -> CGPoint? {
         let item: NSStatusItem = if self.shouldMergeIcons {
             self.statusItem
-        } else if let provider, let existing = self.statusItems[provider], existing.isVisible {
+        } else if let provider, let existing = self.statusItems[provider.instanceID], existing.isVisible {
             existing
         } else {
             self.lazyStatusItem(for: provider ?? .codex)
@@ -602,7 +617,15 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
                 self.preferencesSelection.pane = pane
             }
             NSApp.activate(ignoringOtherApps: true)
-            NotificationCenter.default.post(name: .codexbarOpenSettings, object: nil)
+            let outcome = SettingsWindowOpener.live().open(preferred: .notification)
+            switch outcome {
+            case .preferred:
+                break
+            case .fallback:
+                self.menuLogger.warning("Settings notification relay unavailable; used AppKit fallback")
+            case .failed:
+                self.menuLogger.error("Failed to open Settings; notification relay and AppKit fallback unavailable")
+            }
         }
     }
 
@@ -630,9 +653,9 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     func openTerminal(command: String) {
         let terminal = self.settings.terminalApp
 
-        if terminal == .iTerm, !terminal.isInstalled {
+        if terminal != .terminal, !terminal.isInstalled {
             CodexBarLog.logger(LogCategories.terminal).warning(
-                "iTerm is not installed, falling back to Terminal.app",
+                "\(terminal.label) is not installed, falling back to Terminal.app",
                 metadata: ["terminal": terminal.rawValue])
             Self.openTerminalInDefaultTerminal(command: command)
             return
@@ -672,10 +695,10 @@ extension StatusItemController: StatusItemMenuPersistentActionDelegate {
     }
 
     private func resolvedShortcutProvider() -> UsageProvider {
-        if let last = self.lastMenuProvider, self.isEnabled(last) {
+        if let last = self.lastMenuProvider?.firstPartyProvider, self.isEnabled(last) {
             return last
         }
-        if let first = self.store.enabledProviders().first {
+        if let first = self.store.enabledFirstPartyProviders().first {
             return first
         }
         return .codex

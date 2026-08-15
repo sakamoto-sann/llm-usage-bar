@@ -9,7 +9,12 @@ struct CursorMenuCardModelTests {
         let now = Date(timeIntervalSince1970: 0)
         let metadata = try #require(ProviderDefaults.metadata[.cursor])
 
-        func makeModel(personalUsed: Double?) -> UsageMenuCardView.Model {
+        #expect(metadata.supportsCredits == false)
+
+        func makeModel(
+            personalUsed: Double?,
+            showOptionalUsage: Bool = true) -> UsageMenuCardView.Model
+        {
             let snapshot = UsageSnapshot(
                 primary: nil,
                 secondary: nil,
@@ -39,7 +44,7 @@ struct CursorMenuCardModelTests {
                 usageBarsShowUsed: false,
                 resetTimeDisplayStyle: .countdown,
                 tokenCostUsageEnabled: false,
-                showOptionalCreditsAndExtraUsage: true,
+                showOptionalCreditsAndExtraUsage: showOptionalUsage,
                 hidePersonalInfo: false,
                 now: now))
         }
@@ -47,10 +52,14 @@ struct CursorMenuCardModelTests {
         let personal = makeModel(personalUsed: 44.71)
         let absent = makeModel(personalUsed: nil)
         let zero = makeModel(personalUsed: 0)
+        let hidden = makeModel(personalUsed: 44.71, showOptionalUsage: false)
 
+        #expect(personal.creditsText == nil)
+        #expect(personal.providerCost?.title == "Extra usage")
         #expect(personal.providerCost?.personalSpendLine == "Your spend: $44.71")
         #expect(absent.providerCost?.personalSpendLine == nil)
         #expect(zero.providerCost?.personalSpendLine == nil)
+        #expect(hidden.providerCost == nil)
         #expect(personal.heightFingerprint(section: "card") != absent.heightFingerprint(section: "card"))
         #expect(!personal.hasCompatibleTrackedLayout(with: absent))
         #expect(!absent.hasCompatibleTrackedLayout(with: personal))
@@ -152,7 +161,7 @@ struct CursorMenuCardModelTests {
         let cycleMinutes = 30 * 24 * 60
         // A legacy snapshot, as produced by CursorStatusSnapshot.toUsageSnapshot(): only the request
         // window survives, Auto/API are dropped, and the request count rides along.
-        let snapshot = UsageSnapshot(
+        let snapshot = try UsageSnapshot(
             primary: RateWindow(
                 usedPercent: 69.4,
                 windowMinutes: cycleMinutes,
@@ -160,7 +169,9 @@ struct CursorMenuCardModelTests {
                 resetDescription: nil),
             secondary: nil,
             tertiary: nil,
-            cursorRequests: CursorRequestUsage(used: 347, limit: 500),
+            details: [ProviderDetailSection(rows: [
+                ProviderDetailSection.Row(label: "Request quota", value: "347 / 500"),
+            ])],
             updatedAt: now,
             identity: nil)
         let metadata = try #require(ProviderDefaults.metadata[.cursor])

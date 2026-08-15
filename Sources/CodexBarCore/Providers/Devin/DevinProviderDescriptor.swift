@@ -1,11 +1,23 @@
 import Foundation
+import SweetCookieKit
 
 public enum DevinProviderDescriptor {
     public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
 
+    /// Devin sessions are normally in Chrome; explicit selection handles other browsers.
+    private static var browserCookieOrder: BrowserCookieImportOrder? {
+        #if os(macOS)
+        [.chrome]
+        #else
+        nil
+        #endif
+    }
+
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .devin,
+            settingsSection: .init(DevinProviderSettingsKey.self),
+            config: ProviderConfigCapabilities(workspaceIDValidationOrder: 4),
             metadata: ProviderMetadata(
                 id: .devin,
                 displayName: "Devin",
@@ -20,17 +32,43 @@ public enum DevinProviderDescriptor {
                 defaultEnabled: false,
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
-                browserCookieOrder: ProviderBrowserCookieDefaults.devinCookieImportOrder,
+                sharePlanLabels: [
+                    "free": "Free",
+                    "core": "Core",
+                    "pro": "Pro",
+                    "team": "Team",
+                    "enterprise": "Enterprise",
+                ],
+                browserCookieOrder: self.browserCookieOrder,
                 dashboardURL: "https://app.devin.ai",
                 subscriptionDashboardURL: "https://app.devin.ai/settings/usage",
                 statusPageURL: nil),
             branding: ProviderBranding(
-                iconStyle: .devin,
+                iconStyle: .init(provider: .devin),
                 iconResourceName: "ProviderIcon-devin",
-                color: ProviderColor(red: 70 / 255, green: 180 / 255, blue: 130 / 255)),
+                color: ProviderColor(red: 70 / 255, green: 180 / 255, blue: 130 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x000000),
+                    ProviderColor(hex: 0x626870),
+                    ProviderColor(hex: 0xFFFFFF),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Devin cost summary is not supported." }),
+            presentation: ProviderUsagePresentation(
+                costPresenter: { snapshot in
+                    guard let cost = snapshot.providerCost, cost.period == "Extra usage balance" else {
+                        return ProviderCostPresentation()
+                    }
+                    return ProviderCostPresentation(
+                        showsGenericFallback: false,
+                        balances: [ProviderCostPresentation.Balance(
+                            label: "Extra usage",
+                            amount: cost.used,
+                            currencyCode: cost.currencyCode)],
+                        menuCardStyle: .extraUsageBalance)
+                },
+                menuCard: ProviderMenuCardPresentation(costVisibilityResolver: { $0.showOptionalUsage })),
             fetchPlan: ProviderFetchPlan(
                 sourceModes: [.auto, .web],
                 pipeline: ProviderFetchPipeline(resolveStrategies: { _ in [DevinWebFetchStrategy()] })),
@@ -62,7 +100,7 @@ struct DevinWebFetchStrategy: ProviderFetchStrategy {
         let fetcher = DevinUsageFetcher(browserDetection: context.browserDetection)
         let settings = context.settings?.devin
         let logger: ((String) -> Void)? = context.verbose
-            ? { msg in CodexBarLog.logger(LogCategories.devin).verbose(msg) }
+            ? { msg in CodexBarLog.logger(LogCategories.provider(.devin)).verbose(msg) }
             : nil
         let snapshot = try await fetcher.fetch(
             bearerTokenOverride: settings?.cookieSource == .manual ? Self.bearerTokenOverride(context: context) : nil,

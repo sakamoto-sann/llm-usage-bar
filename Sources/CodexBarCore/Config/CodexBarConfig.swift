@@ -3,12 +3,65 @@ import Foundation
 public struct CodexBarConfig: Codable, Sendable {
     public static let currentVersion = 1
 
+    private static let log = CodexBarLog.logger(LogCategories.configStore)
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case providers
+        case hooks
+    }
+
+    private enum ProviderCodingKeys: String, CodingKey {
+        case id
+    }
+
     public var version: Int
     public var providers: [ProviderConfig]
+    /// Optional external event hooks. Absent (nil) or disabled means no hooks run.
+    public var hooks: HooksConfig?
 
-    public init(version: Int = Self.currentVersion, providers: [ProviderConfig]) {
+    public init(
+        version: Int = Self.currentVersion,
+        providers: [ProviderConfig],
+        hooks: HooksConfig? = nil)
+    {
         self.version = version
         self.providers = providers
+        self.hooks = hooks
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.version = try container.decode(Int.self, forKey: .version)
+
+        var providersContainer = try container.nestedUnkeyedContainer(forKey: .providers)
+        var providers: [ProviderConfig] = []
+        while !providersContainer.isAtEnd {
+            let providerDecoder = try providersContainer.superDecoder()
+            let providerContainer = try providerDecoder.container(keyedBy: ProviderCodingKeys.self)
+            let rawID = try providerContainer.decode(String.self, forKey: .id)
+            guard let instanceID = ProviderInstanceID(rawValue: rawID),
+                  Self.isKnownProviderInstance(instanceID)
+            else {
+                Self.log.warning("Ignoring unknown provider in config", metadata: ["provider": rawID])
+                continue
+            }
+            try providers.append(ProviderConfig(from: providerDecoder))
+        }
+        self.providers = providers
+        self.hooks = try container.decodeIfPresent(HooksConfig.self, forKey: .hooks)
+    }
+
+    /// User plugins exist only where JavaScriptCore does; other platforms drop their config entries.
+    private static func isKnownProviderInstance(_ instanceID: ProviderInstanceID) -> Bool {
+        if instanceID.firstPartyProvider != nil {
+            return true
+        }
+        #if canImport(JavaScriptCore)
+        return UserProviderPluginRegistry.plugin(for: instanceID) != nil
+        #else
+        return false
+        #endif
     }
 
     public static func makeDefault(
@@ -33,7 +86,9 @@ public struct CodexBarConfig: Codable, Sendable {
         UsageProvider.allCases.sorted { lhs, rhs in
             let lhsEnabled = enablement(lhs)
             let rhsEnabled = enablement(rhs)
-            if lhsEnabled != rhsEnabled { return lhsEnabled }
+            if lhsEnabled != rhsEnabled {
+                return lhsEnabled
+            }
             let lhsName = metadata[lhs]?.displayName ?? lhs.rawValue
             let rhsName = metadata[rhs]?.displayName ?? rhs.rawValue
             switch lhsName.localizedCaseInsensitiveCompare(rhsName) {
@@ -47,17 +102,20 @@ public struct CodexBarConfig: Codable, Sendable {
     public func normalized(
         metadata: [UsageProvider: ProviderMetadata] = ProviderDescriptorRegistry.metadata) -> CodexBarConfig
     {
-        var seen: Set<UsageProvider> = []
+        var seen: Set<ProviderInstanceID> = []
         var normalized: [ProviderConfig] = []
         normalized.reserveCapacity(max(self.providers.count, UsageProvider.allCases.count))
 
-        for provider in self.providers {
+        for var provider in self.providers {
             guard !seen.contains(provider.id) else { continue }
             seen.insert(provider.id)
+            if let firstPartyProvider = provider.id.firstPartyProvider {
+                ProviderDescriptorRegistry.descriptor(for: firstPartyProvider).normalizeConfig(&provider)
+            }
             normalized.append(provider)
         }
 
-        for provider in UsageProvider.allCases where !seen.contains(provider) {
+        for provider in UsageProvider.allCases where !seen.contains(provider.instanceID) {
             normalized.append(Self.defaultProviderConfig(
                 provider,
                 metadata: metadata,
@@ -66,23 +124,32 @@ public struct CodexBarConfig: Codable, Sendable {
 
         return CodexBarConfig(
             version: Self.currentVersion,
-            providers: normalized)
+            providers: normalized,
+            hooks: self.hooks)
     }
 
-    public func orderedProviders() -> [UsageProvider] {
+    public func sanitizedForDump(showSecrets: Bool = false) -> CodexBarConfig {
+        guard !showSecrets else { return self }
+        var copy = self
+        copy.providers = copy.providers.map { $0.sanitizedForDump() }
+        return copy
+    }
+
+    public func orderedProviders() -> [ProviderInstanceID] {
         self.providers.map(\.id)
     }
 
     public func enabledProviders(
-        metadata: [UsageProvider: ProviderMetadata] = ProviderDescriptorRegistry.metadata) -> [UsageProvider]
+        metadata: [UsageProvider: ProviderMetadata] = ProviderDescriptorRegistry.metadata) -> [ProviderInstanceID]
     {
         self.providers.compactMap { config in
-            let enabled = config.enabled ?? metadata[config.id]?.defaultEnabled ?? false
+            let enabled = config.enabled ?? config.id.firstPartyProvider
+                .flatMap { metadata[$0]?.defaultEnabled } ?? false
             return enabled ? config.id : nil
         }
     }
 
-    public func providerConfig(for id: UsageProvider) -> ProviderConfig? {
+    public func providerConfig(for id: ProviderInstanceID) -> ProviderConfig? {
         self.providers.first(where: { $0.id == id })
     }
 
@@ -100,14 +167,14 @@ public struct CodexBarConfig: Codable, Sendable {
         alibabaTokenPlanRegion: AlibabaTokenPlanAPIRegion) -> ProviderConfig
     {
         ProviderConfig(
-            id: provider,
+            id: provider.instanceID,
             enabled: metadata[provider]?.defaultEnabled,
             region: provider == .alibabatokenplan ? alibabaTokenPlanRegion.rawValue : nil)
     }
 }
 
 public struct ProviderConfig: Codable, Sendable, Identifiable {
-    public let id: UsageProvider
+    public let id: ProviderInstanceID
     public var enabled: Bool?
     public var source: ProviderSourceMode?
     public var extrasEnabled: Bool?
@@ -119,18 +186,14 @@ public struct ProviderConfig: Codable, Sendable, Identifiable {
     public var workspaceID: String?
     public var enterpriseHost: String?
     public var tokenAccounts: ProviderTokenAccountData?
-    public var claudeSwapEnabled: Bool?
-    public var claudeSwapExecutablePath: String?
-    public var codexActiveSource: CodexActiveSource?
-    public var codexProfileHomePaths: [String]?
     public var quotaWarnings: QuotaWarningConfig?
-    public var kiloKnownOrganizations: [KiloOrganization]?
-    public var kiloEnabledOrganizationIDs: [String]?
-    public var awsProfile: String?
-    public var awsAuthMode: String?
+    /// Arbitrary user-plugin values stay scoped to the provider instance. Secure values are redacted from config dumps.
+    public var pluginSettings: [String: String]?
+    public var pluginSecrets: [String: String]?
+    var extensionValues: [String: ProviderConfigExtensionValue]
 
     public init(
-        id: UsageProvider,
+        id: ProviderInstanceID,
         enabled: Bool? = nil,
         source: ProviderSourceMode? = nil,
         extrasEnabled: Bool? = nil,
@@ -142,15 +205,9 @@ public struct ProviderConfig: Codable, Sendable, Identifiable {
         workspaceID: String? = nil,
         enterpriseHost: String? = nil,
         tokenAccounts: ProviderTokenAccountData? = nil,
-        claudeSwapEnabled: Bool? = nil,
-        claudeSwapExecutablePath: String? = nil,
-        codexActiveSource: CodexActiveSource? = nil,
-        codexProfileHomePaths: [String]? = nil,
         quotaWarnings: QuotaWarningConfig? = nil,
-        kiloKnownOrganizations: [KiloOrganization]? = nil,
-        kiloEnabledOrganizationIDs: [String]? = nil,
-        awsProfile: String? = nil,
-        awsAuthMode: String? = nil)
+        pluginSettings: [String: String]? = nil,
+        pluginSecrets: [String: String]? = nil)
     {
         self.id = id
         self.enabled = enabled
@@ -164,15 +221,10 @@ public struct ProviderConfig: Codable, Sendable, Identifiable {
         self.workspaceID = workspaceID
         self.enterpriseHost = enterpriseHost
         self.tokenAccounts = tokenAccounts
-        self.claudeSwapEnabled = claudeSwapEnabled
-        self.claudeSwapExecutablePath = claudeSwapExecutablePath
-        self.codexActiveSource = codexActiveSource
-        self.codexProfileHomePaths = codexProfileHomePaths
         self.quotaWarnings = quotaWarnings
-        self.kiloKnownOrganizations = kiloKnownOrganizations
-        self.kiloEnabledOrganizationIDs = kiloEnabledOrganizationIDs
-        self.awsProfile = awsProfile
-        self.awsAuthMode = awsAuthMode
+        self.pluginSettings = pluginSettings
+        self.pluginSecrets = pluginSecrets
+        self.extensionValues = [:]
     }
 
     public var sanitizedAPIKey: String? {
@@ -199,19 +251,27 @@ public struct ProviderConfig: Codable, Sendable, Identifiable {
         Self.clean(self.enterpriseHost)
     }
 
-    public var sanitizedClaudeSwapExecutablePath: String? {
-        Self.clean(self.claudeSwapExecutablePath)
+    public func sanitizedForDump() -> ProviderConfig {
+        var copy = self
+        if copy.apiKey != nil {
+            copy.apiKey = "[REDACTED]"
+        }
+        if copy.secretKey != nil {
+            copy.secretKey = "[REDACTED]"
+        }
+        if copy.cookieHeader != nil {
+            copy.cookieHeader = "[REDACTED]"
+        }
+        if copy.pluginSecrets != nil {
+            copy.pluginSecrets = copy.pluginSecrets?.mapValues { _ in "[REDACTED]" }
+        }
+        if let tokenAccounts = copy.tokenAccounts {
+            copy.tokenAccounts = tokenAccounts.sanitizedForDump()
+        }
+        return copy
     }
 
-    public var sanitizedAWSProfile: String? {
-        Self.clean(self.awsProfile)
-    }
-
-    public var sanitizedAWSAuthMode: String? {
-        Self.clean(self.awsAuthMode)
-    }
-
-    private static func clean(_ raw: String?) -> String? {
+    static func clean(_ raw: String?) -> String? {
         guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
             return nil
         }

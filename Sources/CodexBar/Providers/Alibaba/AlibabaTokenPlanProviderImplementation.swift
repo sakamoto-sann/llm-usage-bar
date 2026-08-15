@@ -3,6 +3,7 @@ import CodexBarCore
 import Foundation
 import SwiftUI
 
+/// Provider-specific by design: The Alibaba folder co-locates the distinct Alibaba Token Plan variant.
 struct AlibabaTokenPlanProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .alibabatokenplan
 
@@ -37,12 +38,15 @@ struct AlibabaTokenPlanProviderImplementation: ProviderImplementation {
             allowsOff: false,
             keychainDisabled: context.settings.debugDisableKeychainAccess)
         let cookieSubtitle: () -> String? = {
-            let host = context.settings.alibabaTokenPlanAPIRegion.dashboardURL.host ?? "the selected console"
+            let region = context.settings.alibabaTokenPlanAPIRegion
+            let host = region.usesPersonalTokenPlanAPI
+                ? URL(string: region.quotaBaseURLString)?.host
+                : region.dashboardURL.host
             return ProviderCookieSourceUI.subtitle(
                 source: context.settings.alibabaTokenPlanCookieSource,
                 keychainDisabled: context.settings.debugDisableKeychainAccess,
                 auto: "Automatic imports browser cookies from Model Studio/Bailian.",
-                manual: "Paste a Cookie header from \(host).",
+                manual: "Paste a Cookie header from \(host ?? "the selected console").",
                 off: "Alibaba Token Plan cookies are disabled.")
         }
 
@@ -66,6 +70,7 @@ struct AlibabaTokenPlanProviderImplementation: ProviderImplementation {
                 isVisible: nil,
                 onChange: nil,
                 trailingText: {
+                    // Provider-specific by design: This picker reads the co-located Token Plan variant's cache.
                     ProviderCookieSourceUI.cachedTrailingText(
                         provider: .alibabatokenplan,
                         scope: context.settings.alibabaTokenPlanAPIRegion.cookieCacheScope)

@@ -76,6 +76,56 @@ struct AdaptiveRefreshTimerTests {
     }
 
     @Test
+    func `coding activity advances a long idle timer without postponing an earlier tick`() async throws {
+        let settings = Self.makeSettingsStore(
+            suite: "AdaptiveRefreshTimerTests-activity-advance",
+            frequency: .adaptiveAgentAware)
+        settings.adaptiveActivityScanConsent = .allowed
+        let store = Self.makeUsageStore(settings: settings, startupBehavior: .testing)
+        store.restartTimerWithSleepOverrideForTesting(.seconds(10))
+        try await Self.waitUntil { store.adaptiveRefreshScheduledAt != nil }
+
+        let longIdleSchedule = try #require(store.adaptiveRefreshScheduledAt)
+        let observedAt = Date()
+        store.noteCodingActivityObserved(at: observedAt, now: observedAt)
+        try await Self.waitUntil {
+            guard let scheduledAt = store.adaptiveRefreshScheduledAt else { return false }
+            return scheduledAt < longIdleSchedule
+        }
+        let activitySchedule = try #require(store.adaptiveRefreshScheduledAt)
+        #expect(store.lastCodingActivityAt == observedAt)
+
+        // An older observation is ignored. A newer observation is retained, but cannot push an
+        // already earlier provider refresh later.
+        store.noteCodingActivityObserved(
+            at: observedAt.addingTimeInterval(-1),
+            now: observedAt.addingTimeInterval(30))
+        #expect(store.lastCodingActivityAt == observedAt)
+        store.noteCodingActivityObserved(
+            at: observedAt.addingTimeInterval(1),
+            now: observedAt.addingTimeInterval(30))
+        #expect(store.lastCodingActivityAt == observedAt.addingTimeInterval(1))
+        #expect(store.adaptiveRefreshScheduledAt == activitySchedule)
+    }
+
+    @Test
+    func `plain adaptive ignores coding activity`() async throws {
+        let settings = Self.makeSettingsStore(
+            suite: "AdaptiveRefreshTimerTests-plain-adaptive-activity",
+            frequency: .adaptive)
+        settings.adaptiveActivityScanConsent = .allowed
+        let store = Self.makeUsageStore(settings: settings, startupBehavior: .testing)
+        store.restartTimerWithSleepOverrideForTesting(.seconds(10))
+        try await Self.waitUntil { store.adaptiveRefreshScheduledAt != nil }
+        let scheduledAt = try #require(store.adaptiveRefreshScheduledAt)
+
+        store.noteCodingActivityObserved(at: Date())
+
+        #expect(store.adaptiveRefreshScheduledAt == scheduledAt)
+        #expect(store.lastCodingActivityAt == nil)
+    }
+
+    @Test
     func `noting a menu open records the signal without starting a refresh`() {
         let settings = Self.makeSettingsStore(suite: "AdaptiveRefreshTimerTests-noteMenuOpened", frequency: .manual)
         let store = Self.makeUsageStore(settings: settings, startupBehavior: .testing)
@@ -88,6 +138,36 @@ struct AdaptiveRefreshTimerTests {
         #expect(store.lastMenuOpenAt != nil)
         #expect(store.completedRefreshCountForTesting == 0)
         #expect(store.isRefreshing == false)
+    }
+
+    @Test
+    func `noting coding activity outside agent aware mode is a no-op`() {
+        let settings = Self.makeSettingsStore(
+            suite: "AdaptiveRefreshTimerTests-noteCodingActivity",
+            frequency: .fiveMinutes)
+        let store = Self.makeUsageStore(settings: settings, startupBehavior: .testing)
+        let observedAt = Date()
+
+        store.noteCodingActivityObserved(at: observedAt)
+
+        #expect(store.lastCodingActivityAt == nil)
+        #expect(store.adaptiveRefreshScheduledAt == nil)
+        #expect(store.completedRefreshCountForTesting == 0)
+    }
+
+    @Test
+    func `clearing coding activity removes the adaptive input`() {
+        let settings = Self.makeSettingsStore(
+            suite: "AdaptiveRefreshTimerTests-clearCodingActivity",
+            frequency: .adaptiveAgentAware)
+        settings.adaptiveActivityScanConsent = .allowed
+        let store = Self.makeUsageStore(settings: settings, startupBehavior: .testing)
+        store.noteCodingActivityObserved(at: Date(timeIntervalSinceReferenceDate: 100))
+        #expect(store.lastCodingActivityAt != nil)
+
+        store.clearCodingActivityObservation()
+
+        #expect(store.lastCodingActivityAt == nil)
     }
 
     @Test
@@ -128,6 +208,42 @@ struct AdaptiveRefreshTimerTests {
         // seconds of wall time even with every provider disabled, so the timeout is generous.
         try await Self.waitUntil(timeout: .seconds(45)) { store.completedRefreshCountForTesting >= 2 }
         #expect(store.completedRefreshCountForTesting >= 2)
+    }
+
+    @Test
+    func `fixed timer uses global low power interval without changing test sleep override`() throws {
+        let settings = Self.makeSettingsStore(
+            suite: "AdaptiveRefreshTimerTests-fixed-global-low-power",
+            frequency: .fiveMinutes)
+        settings.backgroundWorkLowPowerModeEnabled = true
+        let store = Self.makeUsageStore(settings: settings, startupBehavior: .testing)
+
+        store.restartTimerWithSleepOverrideForTesting(.seconds(10))
+
+        let computedInterval = try #require(store.fixedRefreshIntervalForTesting)
+        #expect(computedInterval == 30 * 60)
+        #expect(store.refreshTimerSleepOverrideForTesting == .seconds(10))
+    }
+
+    @Test
+    func `adaptive timer publishes clamped schedule while preserving test sleep override`() async throws {
+        let settings = Self.makeSettingsStore(
+            suite: "AdaptiveRefreshTimerTests-adaptive-global-low-power",
+            frequency: .adaptive)
+        settings.backgroundWorkLowPowerModeEnabled = true
+        let store = Self.makeUsageStore(settings: settings, startupBehavior: .testing)
+        let now = Date()
+        store.noteMenuOpened(at: now.addingTimeInterval(-10 * 60))
+        store.restartTimerWithSleepOverrideForTesting(.seconds(10))
+
+        let sleepDuration = try #require(await UsageStore.nextAdaptiveTimerSleepDuration(for: store))
+
+        let computedInterval = try #require(store.adaptiveRefreshComputedIntervalForTesting)
+        #expect(computedInterval == 30 * 60)
+        #expect(sleepDuration == .seconds(10))
+        let scheduledAt = try #require(store.adaptiveRefreshScheduledAt)
+        #expect(scheduledAt.timeIntervalSince(Date()) > 29 * 60)
+        #expect(scheduledAt.timeIntervalSince(Date()) <= 30 * 60)
     }
 
     @Test
@@ -331,7 +447,6 @@ struct AdaptiveRefreshTimerTests {
             minimaxCookieStore: InMemoryMiniMaxCookieStore(),
             minimaxAPITokenStore: InMemoryMiniMaxAPITokenStore(),
             kimiTokenStore: InMemoryKimiTokenStore(),
-            kimiK2TokenStore: InMemoryKimiK2TokenStore(),
             augmentCookieStore: InMemoryCookieHeaderStore(),
             ampCookieStore: InMemoryCookieHeaderStore(),
             copilotTokenStore: InMemoryCopilotTokenStore(),

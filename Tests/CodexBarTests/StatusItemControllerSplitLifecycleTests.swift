@@ -124,7 +124,7 @@ struct StatusItemControllerSplitLifecycleTests {
         defer { controller.releaseStatusItemsForTesting() }
 
         let menus = try [UsageProvider.codex, .claude].map { provider in
-            try #require(controller.providerMenus[provider])
+            try #require(controller.providerMenus[provider.instanceID])
         }
         let keys = menus.map(ObjectIdentifier.init)
         for (menu, key) in zip(menus, keys) {
@@ -209,6 +209,9 @@ struct StatusItemControllerSplitLifecycleTests {
         #expect(controller.statusItem.button?.accessibilityTitle() == "LLM Usage Bar")
         #expect(codexButton.accessibilityTitle() == "LLM Usage Bar")
         #expect(claudeButton.accessibilityTitle() == "LLM Usage Bar")
+        #expect(controller.statusItem.button?.toolTip == nil)
+        #expect(codexButton.toolTip == nil)
+        #expect(claudeButton.toolTip == nil)
     }
 
     @Test

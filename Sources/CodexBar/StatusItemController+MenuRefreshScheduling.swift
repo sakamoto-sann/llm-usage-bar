@@ -110,6 +110,7 @@ extension StatusItemController {
             from: dashboard?.usageBreakdown ?? [])
         var parts = [
             "costEnabled=\(self.settings.costUsageEnabled ? "1" : "0")",
+            "codexLocalCost=\(self.settings.codexLocalSessionCostLedgerEnabled ? "1" : "0")",
             "costStyle=\(self.settings.costSummaryDisplayStyle.rawValue)",
             "openAIAttached=\(self.store.openAIDashboardAttachmentAuthorized ? "1" : "0")",
             "openAILogin=\(self.store.openAIDashboardRequiresLogin ? "1" : "0")",
@@ -121,7 +122,7 @@ extension StatusItemController {
             "claudeSwapRevision=\(self.store.claudeSwapRevision)",
         ]
 
-        for provider in self.store.enabledProvidersForDisplay() {
+        for provider in self.store.enabledFirstPartyProvidersForDisplay() {
             let tokenSignature = self.tokenSnapshotReadinessSignature(for: provider)
             let usageHistoryVisible = self.store.supportsPlanUtilizationHistory(for: provider) &&
                 !self.store.shouldHidePlanUtilizationMenuItem(for: provider)

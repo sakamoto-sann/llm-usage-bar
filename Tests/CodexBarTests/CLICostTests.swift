@@ -17,6 +17,17 @@ struct CLICostTests {
     }
 
     @Test
+    func `provider native only excludes pi and OMP session mirrors`() throws {
+        let parser = CommandParser(signature: CodexBarCLI._costSignatureForTesting())
+
+        let defaultValues = try parser.parse(arguments: [])
+        #expect(CodexBarCLI.decodeCostIncludePiSessions(from: defaultValues))
+
+        let nativeOnlyValues = try parser.parse(arguments: ["--provider-native-only"])
+        #expect(!CodexBarCLI.decodeCostIncludePiSessions(from: nativeOnlyValues))
+    }
+
+    @Test
     func `renders cost text snapshot`() {
         let snap = CostUsageTokenSnapshot(
             sessionTokens: 1200,
@@ -89,7 +100,7 @@ struct CLICostTests {
             .replacingOccurrences(of: "\u{00A0}", with: " ")
             .replacingOccurrences(of: "$ ", with: "$")
 
-        #expect(output.contains("Codex Cost (API-rate estimate)"))
+        #expect(output.contains("Codex API-equivalent estimate (not billed)"))
         #expect(output.contains("Projects (Last 30 days):"))
         #expect(output.contains("client-a: $7.50 · 7K tokens"))
         #expect(output.contains("/work/client-a"))
@@ -97,6 +108,7 @@ struct CLICostTests {
         #expect(output.contains("  - client-a: $2.25 · 2K tokens"))
         #expect(output.contains("/Users/test/.codex/worktrees/abcd/client-a"))
         #expect(output.contains("Unknown project: $2.49 · 2K tokens"))
+        #expect(output.contains("Not a subscription bill or plan value · local usage × public API prices"))
     }
 
     @Test
@@ -154,6 +166,26 @@ struct CLICostTests {
         #expect(json.contains("\"totalCost\""))
         #expect(json.contains("\"totalTokens\":15"))
         #expect(json.contains("1700000000"))
+    }
+
+    @Test
+    func `cost JSON exposes history coverage as a boolean`() throws {
+        for coverage in [false, true] {
+            let snapshot = CostUsageTokenSnapshot(
+                sessionTokens: 10,
+                sessionCostUSD: 0.01,
+                last30DaysTokens: 40,
+                last30DaysCostUSD: 0.04,
+                historyCoverageIsEstablished: coverage,
+                daily: [],
+                updatedAt: Date(timeIntervalSince1970: 1_700_000_000))
+            let payload = CodexBarCLI.makeCostPayload(provider: .codex, snapshot: snapshot, error: nil)
+            let data = try JSONEncoder().encode(payload)
+            let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+            #expect(object.keys.contains("historyCoverageIsEstablished"))
+            #expect(object["historyCoverageIsEstablished"] as? Bool == coverage)
+        }
     }
 
     @Test
@@ -295,5 +327,55 @@ struct CLICostTests {
         #expect(!hint.isEmpty)
         #expect(hint.contains("Estimated"))
         #expect(UsageFormatter.costEstimateHint(provider: .claude).contains("cache read/write tokens"))
+    }
+
+    @Test
+    func `cursor cookie source off produces a failed JSON payload`() throws {
+        let settings = ProviderSettingsSnapshot.CursorProviderSettings(
+            cookieSource: .off,
+            manualCookieHeader: nil)
+        let error = try #require(CodexBarCLI.cursorCostAvailabilityError(.cursor, settings: settings))
+        let payload = CodexBarCLI.makeCostPayload(provider: .cursor, snapshot: nil, error: error)
+        let json = try #require(CodexBarCLI.encodeJSON([payload], pretty: false))
+
+        #expect(CodexBarCLI.mapError(error) == .failure)
+        #expect(json.contains("\"provider\":\"cursor\""))
+        #expect(json.contains("\"code\":1"))
+        #expect(json.contains("cookie source is set to Off"))
+        #expect(CodexBarCLI.cursorCostAvailabilityError(.cursor, settings: nil) == nil)
+        #expect(CodexBarCLI.cursorCostAvailabilityError(.codex, settings: settings) == nil)
+    }
+
+    @Test
+    func `cursor manual cookie source rejects an empty header`() throws {
+        let settings = ProviderSettingsSnapshot.CursorProviderSettings(
+            cookieSource: .manual,
+            manualCookieHeader: "  ")
+        let error = try #require(CodexBarCLI.cursorCostAvailabilityError(.cursor, settings: settings))
+
+        #expect(CodexBarCLI.mapError(error) == .failure)
+        #expect(error.localizedDescription.contains("non-empty Manual cookie header"))
+        #expect(CodexBarCLI.cursorCostHeaderOverride(.cursor, settings: settings) == nil)
+    }
+
+    @Test
+    func `cursor settings resolution errors fail closed`() throws {
+        let resolutionError = CursorCostSettingsTestError()
+        let error = try #require(CodexBarCLI.cursorCostAvailabilityError(
+            .cursor,
+            settings: nil,
+            resolutionError: resolutionError))
+
+        #expect(error.localizedDescription == resolutionError.localizedDescription)
+        #expect(CodexBarCLI.cursorCostAvailabilityError(
+            .codex,
+            settings: nil,
+            resolutionError: resolutionError) == nil)
+    }
+}
+
+private struct CursorCostSettingsTestError: LocalizedError {
+    var errorDescription: String? {
+        "Cursor settings resolution failed."
     }
 }

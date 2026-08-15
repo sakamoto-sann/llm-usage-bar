@@ -104,6 +104,18 @@ struct KeychainPromptSafetyAuditTests {
     }
 
     @Test
+    func `prompt audit accepts interactive Claude keychain read double`() {
+        let lines: [Substring] = [
+            "ClaudeOAuthCredentialsStore.withInteractiveClaudeKeychainReadOverridesForTesting(",
+            "    operation: {",
+            "        allowKeychainPrompt: true",
+            "    })",
+        ]
+
+        #expect(Self.hasOpenKeychainTestDouble(lines: lines, before: 3))
+    }
+
+    @Test
     func `tests do not call Security item APIs except no UI query coverage`() throws {
         let securityItemCalls = ["SecItemCopyMatching", "SecItemUpdate", "SecItemAdd", "SecItemDelete"]
         let offenders = try Self.swiftTestFiles().filter { file in
@@ -128,6 +140,32 @@ struct KeychainPromptSafetyAuditTests {
             }
 
         #expect(offenders.isEmpty, "Security item access bypasses KeychainSecurity: \(offenders.map(\.path))")
+    }
+
+    @Test
+    func `production source resolves Security symbols via dlsym only in audited files`() throws {
+        // dlsym-resolved Security APIs (deprecated ACL/interaction functions) bypass
+        // a plain "SecItem*" grep; keep them enumerable so new runtime-resolved
+        // Security calls cannot slip past this audit unseen.
+        let allowedFiles = [
+            "Sources/CodexBarCore/KeychainCacheStore.swift",
+            // Audited 2026-08-02: resolves only read-only ACL inspection functions
+            // (SecKeychainItemCopyAccess, SecAccessCopyMatchingACLList, SecACLCopyContents,
+            // SecTrustedApplicationValidateWithPath); attributes-only, cannot prompt (#2528).
+            "Sources/CodexBarCore/KeychainAccessPreflight.swift",
+            "Sources/CodexBarCore/KeychainNoUIQuery.swift",
+            "Sources/CodexBarCore/KeychainSecurity.swift",
+        ]
+        let offenders = try Self.swiftFiles(
+            under: Self.repoRoot().appendingPathComponent("Sources", isDirectory: true))
+            .filter { file in
+                guard !allowedFiles.contains(where: file.path.hasSuffix) else { return false }
+                let text = try Self.readFile(file)
+                guard text.contains("dlsym") else { return false }
+                return text.contains("\"Sec") || text.contains("Security.framework")
+            }
+
+        #expect(offenders.isEmpty, "Unaudited dlsym-resolved Security access: \(offenders.map(\.path))")
     }
 
     private static func repoRoot() -> URL {
@@ -176,6 +214,7 @@ struct KeychainPromptSafetyAuditTests {
     private static func hasOpenKeychainTestDouble(lines: [Substring], before oneBasedLineNumber: Int) -> Bool {
         let helperNames = [
             "withClaudeKeychainOverridesForTesting",
+            "withInteractiveClaudeKeychainReadOverridesForTesting",
             "withKeychainAccessOverrideForTesting(true)",
             "withSecurityCLIReadOverrideForTesting",
             "KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting",

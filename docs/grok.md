@@ -1,5 +1,5 @@
 ---
-summary: "Grok provider data sources: ACP JSON-RPC, grok.com billing fallback, OAuth credentials, and local session signals."
+summary: "Grok provider data sources: ACP JSON-RPC, CLI-proxy and grok.com billing fallbacks, OAuth credentials, and local session signals."
 read_when:
   - Debugging Grok billing/usage parsing
   - Updating `grok agent stdio` JSON-RPC integration
@@ -10,36 +10,63 @@ read_when:
 
 Grok uses xAI's official Grok Build CLI (`grok`, released 2026-05-14). Usage data is
 fetched via the ACP JSON-RPC `x.ai/billing` extension method over `grok agent stdio`
-when available, then via grok.com's billing gRPC-web endpoint using the signed-in
-browser session when the CLI surface does not expose billing.
+when available, then via the Grok CLI billing REST API using the local login token.
+The grok.com billing gRPC-web endpoint remains a best-effort fallback.
 
 ## Data sources + fallback order
 
-1) **`~/.grok/auth.json` (primary; always works for SuperGrok subscribers)**
-   - Reads `email`, `team_id`, `first_name`/`last_name`, plan-hint (`auth_mode`)
-     for the identity row in the menu.
+1) **`~/.grok/auth.json` (primary identity source)**
+   - Reads `email`, `team_id`, `first_name`/`last_name`, plan-hint (`auth_mode`),
+     and the optional `principal_type` for the identity row in the menu.
+   - Team principals are recognized on the CLI and web billing paths. Until Grok
+     exposes a supported team usage surface, CodexBar keeps the identity row and
+     reports that team usage is unavailable instead of exposing the personal-team
+     rejection verbatim.
 2) **`grok agent stdio` ACP JSON-RPC** (best-effort, currently disabled in grok 0.1.210)
    - We spawn `grok agent stdio` and call `initialize` + `x.ai/billing` (no params).
    - **Known limitation:** in grok 0.1.210 the `x.ai/billing` extension method
      is only wired in the interactive TUI; the agent-stdio surface returns
-     `-32601 Method not found`. The provider degrades silently to identity-only
-     when this happens. When xAI exposes billing on the agent protocol, no
-     code change is required.
+     `-32601 Method not found`. Personal/unknown principals continue to the web
+     fallback, while a team principal degrades to identity-only with an explicit
+     unsupported-team-usage diagnostic. When xAI exposes billing on the agent
+     protocol, no code change is required.
    - One non-obvious quirk: grok's ACP parser does not unescape `\/` in method
      names. `Foundation.JSONSerialization.data` defaults to escaping forward
      slashes, so payloads must be re-encoded with `\/` → `/` before being
      written to stdin or grok will silently drop them (12s client-side
      timeout instead of the expected error response).
-3) **grok.com billing gRPC-web fallback** (best-effort)
+3) **Grok CLI-proxy billing REST API** (primary web-path attempt)
+   - When a non-expired `~/.grok/auth.json` token exists, GETs
+     `https://cli-chat-proxy.grok.com/v1/billing?format=credits` with
+     `Authorization: Bearer <token>`, `x-xai-token-auth: xai-grok-cli`, and
+     `Accept: application/json`.
+   - Reads `config.creditUsagePercent`, falling back to
+     `onDemandUsed.val / onDemandCap.val * 100`. A parseable current period
+     without either value represents zero usage. The reset timestamp comes from
+     `config.currentPeriod.end`, then `config.billingPeriodEnd`.
+   - This is the Grok CLI's supported token-authenticated billing backend. If it
+     fails, CodexBar continues through the existing browser-cookie and legacy
+     bearer fallbacks.
+4) **grok.com billing gRPC-web fallback** (best-effort)
    - POSTs an empty gRPC-web protobuf request to
      `https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig`.
+   - This endpoint now requires the browser-held Web Key Exchange (WKE) keypair.
+     Cookie-only authentication can fail with gRPC status 16 and
+     `no-credentials`; signing in through Chrome alone cannot provide that proof
+     to CodexBar, so `grok login` is the recommended recovery path.
    - Uses grok.com browser session cookies. When a non-expired
      `~/.grok/auth.json` token is available, CodexBar first sends it with each
      browser session, then retries that session with cookies only.
    - CodexBar imports Chrome only by default to avoid unrelated browser
      Keychain prompts.
-   - CLI/test runtime does not import browser cookies unless
-     `CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT=1` is set.
+   - Ordinary CLI/test runtime does not import browser cookies unless
+     `CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT=1` is set. An explicit
+     `codexbar cookie refresh --provider grok` also opts in for that refresh.
+   - Validated sessions are stored in the Keychain-backed cookie cache and are
+     reused first by later app and CLI fetches, so background work does not
+     re-open the Chromium Keychain gate. The cached cookie is evicted only on
+     authentication failures (HTTP 401/403 or gRPC auth statuses); a cached
+     team-limited session keeps degrading to identity-only data.
    - `~/.grok/auth.json` is still used for identity and as a last best-effort
      bearer-only probe after browser sessions fail. Expired tokens are not sent.
    - Parses the returned protobuf enough to recover used percent and
@@ -47,7 +74,7 @@ browser session when the CLI surface does not expose billing.
      returned by some successful requests. A current billing period with an
      omitted proto3 `credit_usage_percent` is treated as zero usage. This keeps
      billing visible when `grok agent stdio` returns `Method not found`.
-4) **Local session signals** (informational fallback)
+5) **Local session signals** (informational fallback)
    - Walks `~/.grok/sessions/<encoded-cwd>/<session-id>/signals.json` files (last 30 days).
    - Aggregates `totalTokensBeforeCompaction`, `contextTokensUsed`, `modelsUsed`,
      and the most recent session timestamp.
@@ -60,6 +87,7 @@ browser session when the CLI surface does not expose billing.
   `https://accounts.x.ai/sign-in` (legacy session).
 - Required fields per entry: `key` (bearer token), `refresh_token`, `expires_at`,
   `auth_mode`, `email`, `team_id`, `user_id`, `first_name`/`last_name`.
+  `principal_type` is optional because older auth files do not include it.
 - Tokens are issued by `grok login` and expire after ~7 days; refresh is handled by
   the CLI itself (CodexBar does not refresh; it just reads the cached credential).
 
@@ -104,6 +132,8 @@ browser session when the CLI surface does not expose billing.
 - **Primary window** = credit usage (against the subscription/included limit):
   - CLI RPC: `usedPercent` = `usage.totalUsed.val / monthlyLimit.val * 100`;
     `resetsAt` = `billingCycle.billingPeriodEnd`.
+  - CLI-proxy fallback: `usedPercent` from the JSON percent or on-demand ratio;
+    `resetsAt` from the current-period end or billing-period end.
   - grok.com fallback: `usedPercent` and `resetsAt` parsed from the gRPC-web
     billing protobuf.
   - The UI label for the live usage bar is dynamic: "Weekly" or "Monthly"
@@ -145,6 +175,7 @@ points to `https://status.x.ai`.
 - `Sources/CodexBarCore/Providers/Grok/GrokProviderDescriptor.swift`
 - `Sources/CodexBarCore/Providers/Grok/GrokAuth.swift`
 - `Sources/CodexBarCore/Providers/Grok/GrokRPCClient.swift`
+- `Sources/CodexBarCore/Providers/Grok/GrokCreditsProxyFetcher.swift`
 - `Sources/CodexBarCore/Providers/Grok/GrokWebBillingFetcher.swift`
 - `Sources/CodexBarCore/Providers/Grok/GrokStatusProbe.swift`
 - `Sources/CodexBarCore/Providers/Grok/GrokLocalSessionScanner.swift`

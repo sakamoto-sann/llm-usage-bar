@@ -2,13 +2,18 @@ import Foundation
 
 public enum SakanaProviderDescriptor {
     public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+    private static let credentials = ProviderCredentialAdapter(environmentProjections: [
+        .cookieHeader(SakanaSettingsReader.cookieHeaderKey),
+    ])
 
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .sakana,
+            credentials: self.credentials,
             metadata: ProviderMetadata(
                 id: .sakana,
                 displayName: "Sakana AI",
+                shortDisplayName: "Sakana",
                 sessionLabel: "5-hour",
                 weeklyLabel: "Weekly",
                 opusLabel: nil,
@@ -18,18 +23,34 @@ public enum SakanaProviderDescriptor {
                 toggleTitle: "Show Sakana AI usage",
                 cliName: "sakana",
                 defaultEnabled: false,
+                widgetSelectable: false,
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
+                sharePlanLabels: [
+                    "standard": "Standard",
+                    "standard $20/mo": "Standard",
+                    "pro": "Pro",
+                    "enterprise": "Enterprise",
+                ],
+                debugLogUnavailableMessage: "Sakana AI debug log not yet implemented",
                 browserCookieOrder: nil,
                 dashboardURL: "https://console.sakana.ai/billing",
                 statusPageURL: nil),
             branding: ProviderBranding(
-                iconStyle: .sakana,
+                iconStyle: .init(provider: .sakana),
                 iconResourceName: "ProviderIcon-sakana",
-                color: ProviderColor(red: 0.16, green: 0.46, blue: 0.86)),
+                color: ProviderColor(red: 0.16, green: 0.46, blue: 0.86),
+                confettiPalette: [
+                    ProviderColor(hex: 0xE10600),
+                    ProviderColor(hex: 0x0D0D0D),
+                    ProviderColor(hex: 0xFFFFFF),
+                ],
+                widgetColor: ProviderColor(red: 41 / 255, green: 117 / 255, blue: 219 / 255)),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Sakana AI cost summary is not supported." }),
+            presentation: ProviderUsagePresentation(
+                optionalDetails: ProviderOptionalDetailsPresentation(hidesAllWithoutOptionalUsage: true)),
             fetchPlan: ProviderFetchPlan(
                 sourceModes: [.auto, .web],
                 pipeline: ProviderFetchPipeline(resolveStrategies: { _ in
@@ -38,7 +59,11 @@ public enum SakanaProviderDescriptor {
             cli: ProviderCLIConfig(
                 name: "sakana",
                 aliases: ["sakana-ai"],
-                versionDetector: nil))
+                versionDetector: nil,
+                browserSupportExemption: { sourceMode, environment, _ in
+                    guard sourceMode == .auto || sourceMode == .web else { return false }
+                    return environment.map { SakanaSettingsReader.cookieHeader(environment: $0) != nil } == true
+                }))
     }
 }
 

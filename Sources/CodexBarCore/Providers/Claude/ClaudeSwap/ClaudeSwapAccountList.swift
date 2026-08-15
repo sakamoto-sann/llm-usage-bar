@@ -5,9 +5,9 @@ import Foundation
 ///
 /// Only the fields allow-listed in `docs/claude-multi-account-and-status-items.md`
 /// are decoded: slot number, display email, active state, usage status, and the
-/// 5-hour/7-day windows (percent + reset timestamp). Everything else in the
-/// payload is ignored; unknown schema versions and partial top-level shapes are
-/// rejected.
+/// 5-hour/7-day windows and optional model-scoped weekly windows (percent +
+/// reset timestamp). Everything else in the payload is ignored; unknown schema
+/// versions and partial top-level shapes are rejected.
 public struct ClaudeSwapAccountList: Equatable, Sendable {
     public let activeAccountNumber: Int?
     public let accounts: [ClaudeSwapAccountRow]
@@ -26,6 +26,7 @@ public struct ClaudeSwapAccountRow: Equatable, Sendable {
     public let usageStatus: ClaudeSwapUsageStatus
     public let fiveHour: ClaudeSwapUsageWindow?
     public let sevenDay: ClaudeSwapUsageWindow?
+    public let scoped: [ClaudeSwapScopedUsageWindow]
 
     public init(
         number: Int,
@@ -33,7 +34,8 @@ public struct ClaudeSwapAccountRow: Equatable, Sendable {
         isActive: Bool,
         usageStatus: ClaudeSwapUsageStatus,
         fiveHour: ClaudeSwapUsageWindow?,
-        sevenDay: ClaudeSwapUsageWindow?)
+        sevenDay: ClaudeSwapUsageWindow?,
+        scoped: [ClaudeSwapScopedUsageWindow] = [])
     {
         self.number = number
         self.email = email
@@ -41,6 +43,20 @@ public struct ClaudeSwapAccountRow: Equatable, Sendable {
         self.usageStatus = usageStatus
         self.fiveHour = fiveHour
         self.sevenDay = sevenDay
+        self.scoped = scoped
+    }
+}
+
+public struct ClaudeSwapScopedUsageWindow: Equatable, Sendable {
+    /// Display-only provider label; never used as account identity.
+    public let name: String
+    public let usedPercent: Double
+    public let resetsAt: Date?
+
+    public init(name: String, usedPercent: Double, resetsAt: Date?) {
+        self.name = name
+        self.usedPercent = usedPercent
+        self.resetsAt = resetsAt
     }
 }
 
@@ -59,6 +75,7 @@ public struct ClaudeSwapUsageWindow: Equatable, Sendable {
 public enum ClaudeSwapUsageStatus: Equatable, Sendable {
     case ok
     case tokenExpired
+    case reloginRequired
     case apiKey
     case keychainUnavailable
     case noCredentials
@@ -69,6 +86,7 @@ public enum ClaudeSwapUsageStatus: Equatable, Sendable {
         switch rawValue {
         case "ok": self = .ok
         case "token_expired": self = .tokenExpired
+        case "relogin_required": self = .reloginRequired
         case "api_key": self = .apiKey
         case "keychain_unavailable": self = .keychainUnavailable
         case "no_credentials": self = .noCredentials
@@ -176,7 +194,8 @@ public enum ClaudeSwapListParser {
             isActive: isActive,
             usageStatus: ClaudeSwapUsageStatus(rawValue: rawStatus),
             fiveHour: self.parseWindow(usage?["fiveHour"], slot: number, name: "fiveHour"),
-            sevenDay: self.parseWindow(usage?["sevenDay"], slot: number, name: "sevenDay"))
+            sevenDay: self.parseWindow(usage?["sevenDay"], slot: number, name: "sevenDay"),
+            scoped: self.parseScopedWindows(usage?["scoped"]))
     }
 
     private static func parseWindow(_ raw: Any?, slot: Int, name: String) throws -> ClaudeSwapUsageWindow? {
@@ -197,6 +216,29 @@ public enum ClaudeSwapListParser {
         return ClaudeSwapUsageWindow(usedPercent: min(max(pct, 0), 100), resetsAt: resetsAt)
     }
 
+    /// `usage.scoped` is additive schema-v1 data. Ignore malformed or future
+    /// scope rows so they cannot suppress otherwise valid account-wide usage.
+    private static func parseScopedWindows(_ raw: Any?) -> [ClaudeSwapScopedUsageWindow] {
+        guard let rows = raw as? [Any] else { return [] }
+        return rows.compactMap { rawRow in
+            guard let row = rawRow as? [String: Any] else { return nil }
+            guard let rawName = row["name"] as? String else { return nil }
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { return nil }
+            guard let pct = self.finiteDouble(row["pct"]) else { return nil }
+
+            var resetsAt: Date?
+            if let rawResetsAt = row["resetsAt"] {
+                guard let text = rawResetsAt as? String, let date = self.parseTimestamp(text) else { return nil }
+                resetsAt = date
+            }
+            return ClaudeSwapScopedUsageWindow(
+                name: name,
+                usedPercent: min(max(pct, 0), 100),
+                resetsAt: resetsAt)
+        }
+    }
+
     private static func finiteDouble(_ raw: Any?) -> Double? {
         guard let number = raw as? NSNumber else { return nil }
         // JSON booleans bridge to NSNumber too; only accept genuine numbers.
@@ -208,7 +250,9 @@ public enum ClaudeSwapListParser {
     private static func parseTimestamp(_ text: String) -> Date? {
         let withFraction = ISO8601DateFormatter()
         withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFraction.date(from: text) { return date }
+        if let date = withFraction.date(from: text) {
+            return date
+        }
         let plain = ISO8601DateFormatter()
         plain.formatOptions = [.withInternetDateTime]
         return plain.date(from: text)

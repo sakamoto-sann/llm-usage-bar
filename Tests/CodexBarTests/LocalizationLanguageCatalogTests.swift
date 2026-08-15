@@ -86,6 +86,30 @@ struct LocalizationLanguageCatalogTests {
     }
 
     @Test
+    func `adaptive activity consent is localized in every app language`() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let resourcesURL = root.appendingPathComponent("Sources/CodexBar/Resources")
+        let keys = [
+            "refresh_adaptive_agent_aware",
+            "adaptive_activity_consent_title",
+            "adaptive_activity_consent_message",
+            "adaptive_activity_consent_allow",
+            "adaptive_activity_consent_decline",
+        ]
+
+        for language in AppLanguage.allCases where language != .system {
+            let url = resourcesURL.appendingPathComponent("\(language.rawValue).lproj/Localizable.strings")
+            let catalog = try #require(NSDictionary(contentsOf: url) as? [String: String])
+            for key in keys {
+                #expect(catalog[key]?.isEmpty == false, "\(language.rawValue).\(key)")
+            }
+        }
+    }
+
+    @Test
     func `language picker labels use stable native names`() {
         let expected: [AppLanguage: String] = [
             .system: "System",
@@ -236,6 +260,19 @@ struct LocalizationLanguageCatalogTests {
     }
 
     @Test
+    func `german manual action labels do not describe a handbook`() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let germanURL = root.appendingPathComponent("Sources/CodexBar/Resources/de.lproj/Localizable.strings")
+        let german = try #require(NSDictionary(contentsOf: germanURL) as? [String: String])
+
+        #expect(german["Manual"] == "Manuell")
+        #expect(german["refresh_manual"] == "Manuell")
+    }
+
+    @Test
     func `galician localization matches the English catalog`() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -248,6 +285,31 @@ struct LocalizationLanguageCatalogTests {
         let galician = try #require(NSDictionary(contentsOf: galicianURL) as? [String: String])
 
         #expect(Set(galician.keys) == Set(english.keys))
+    }
+
+    @Test
+    func `model breakdown unavailable exists in every app catalog`() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let resourcesURL = root.appendingPathComponent("Sources/CodexBar/Resources")
+        let catalogs = try FileManager.default.contentsOfDirectory(
+            at: resourcesURL,
+            includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "lproj" }
+
+        #expect(catalogs.count == 23)
+        for catalogURL in catalogs {
+            let stringsURL = catalogURL.appendingPathComponent("Localizable.strings")
+            let catalog = try #require(NSDictionary(contentsOf: stringsURL) as? [String: String])
+            let value = try #require(catalog["Model breakdown unavailable"])
+            #expect(!value.isEmpty, "\(catalogURL.lastPathComponent)")
+            #expect(!value.contains("%"), "\(catalogURL.lastPathComponent)")
+            if catalogURL.lastPathComponent == "en.lproj" {
+                #expect(value == "Model breakdown unavailable")
+            }
+        }
     }
 
     @Test
@@ -448,6 +510,7 @@ struct LocalizationLanguageCatalogTests {
             "Deployment",
             "Email",
             "Endpoint",
+            "File",
             "Gemini Flash",
             "GitHub",
             "Google OAuth",
@@ -456,11 +519,15 @@ struct LocalizationLanguageCatalogTests {
             "Password",
             "Provider",
             "Token",
+            "%@ %@",
             "%@: %@",
             "byte_unit_byte",
             "byte_unit_gigabyte",
             "byte_unit_kilobyte",
             "byte_unit_megabyte",
+            "hooks_executable_placeholder",
+            "hooks_provider",
+            "hooks_threshold_placeholder",
             "language_arabic",
             "language_galician",
             "language_italian",
@@ -469,8 +536,11 @@ struct LocalizationLanguageCatalogTests {
             "language_thai",
             "link_email",
             "link_github",
+            "menu_bar_layout_sample_account",
+            "menu_bar_layout_token_account",
             "ory_session_…=…; csrftoken=…",
             "section_privacy",
+            "session_quota_estimate_value_format",
             "tab_menu",
         ]
         let unchanged = Set(english.keys.filter { italian[$0] == english[$0] })

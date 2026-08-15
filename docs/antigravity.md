@@ -15,12 +15,26 @@ the Antigravity app or run `agy`, sign in, then refresh. See `docs/gemini.md` fo
 provider migration notes. CodexBar offers the handoff only after an observed Google migration
 signal and never enables or falls back to Antigravity automatically.
 
+To use the `agy` CLI source without keeping the desktop app open, install the CLI first
+(`brew install --cask antigravity-cli`; use `ANTIGRAVITY_CLI_PATH` when it is not on PATH), then
+run `agy` once and sign in. CodexBar keeps the signed-in `agy` local HTTPS server alive briefly
+after each refresh and stops it when idle.
+
 Antigravity supports four usage data sources:
 
 1. The Antigravity 2.0 app's local `language_server` (preferred when the app is open).
 2. The `agy` CLI's embedded HTTPS localhost server (preferred over the IDE because it exposes richer quota data).
 3. The Antigravity IDE extension `language_server` (used after `agy` CLI because current IDE local payloads only expose session/model quota data).
 4. Google OAuth-backed remote usage (explicit OAuth mode, and the account-scoped fallback used for multi-account switching). The OAuth path can store multiple Google accounts through the shared token-account switcher.
+
+## When the Antigravity app is closed
+
+The app-local `language_server` exists only while Antigravity.app is running. With the app closed,
+CodexBar relies on the `agy` CLI HTTPS source or the Google OAuth fallback. Without a signed-in
+`agy`, the OAuth fallback can only prove model availability, so the menu shows an all-100%
+placeholder instead of real quota numbers. A freshly spawned `agy` needs a few seconds for macOS
+keyring authentication before its quota endpoints answer, so the first refresh after a cold start
+can take a few extra seconds while CodexBar waits for readiness; later refreshes reuse the warmed session.
 
 The local and CLI paths both prefer Antigravity's internal `RetrieveUserQuotaSummary` quota payload and may fall back to
 `GetUserStatus`, then `GetCommandModelConfigs`; CodexBar never scrapes the desktop UI or the `agy` TUI.
@@ -218,6 +232,12 @@ shared OAuth file can still be used as a fallback credential source.
 - Some Antigravity local/CLI model config entries include reset metadata but omit `remainingFraction`. Those windows stay
   in `extraRateWindows` for reset context and are marked with `usageKnown: false`; clients should not render their
   `usedPercent` as a real exhausted quota.
+- Antigravity reports every model family the plan covers, so an account that only uses Gemini still receives a
+  Claude/GPT pair pinned at 0%. Menu cards and widgets hide a family once every lane in it reports known zero usage.
+  A family with unknown usage stays visible, and every family remains visible when all are untouched, for example
+  right after a weekly reset. Provider details is the diagnostic surface and always lists every family, the same
+  principle it already applies to cost data. The filter is display-only: the snapshot, CLI output, and menu-bar
+  ranking still see every window, and menu-bar selection ranks by highest used, so an untouched family never wins.
 
 ## Constraints
 - Internal protocol; fields may change.

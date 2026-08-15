@@ -11,15 +11,15 @@ struct CodexBarUsageWidgetView: View {
     let entry: CodexBarWidgetEntry
 
     var body: some View {
-        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider }
-        ZStack {
-            Color.black.opacity(0.02)
+        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider.instanceID }
+        Group {
             if let providerEntry {
                 self.content(providerEntry: providerEntry)
             } else {
                 self.emptyState
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .containerBackground(.fill.tertiary, for: .widget)
         .environment(\.widgetUsageShowsUsed, self.entry.snapshot.usageBarsShowUsed)
     }
@@ -54,15 +54,15 @@ struct CodexBarHistoryWidgetView: View {
     let entry: CodexBarWidgetEntry
 
     var body: some View {
-        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider }
-        ZStack {
-            Color.black.opacity(0.02)
+        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider.instanceID }
+        Group {
             if let providerEntry {
                 HistoryView(entry: providerEntry, isLarge: self.family == .systemLarge)
             } else {
                 self.emptyState
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .containerBackground(.fill.tertiary, for: .widget)
     }
 
@@ -83,15 +83,15 @@ struct CodexBarCompactWidgetView: View {
     let entry: CodexBarCompactEntry
 
     var body: some View {
-        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider }
-        ZStack {
-            Color.black.opacity(0.02)
+        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider.instanceID }
+        Group {
             if let providerEntry {
                 CompactMetricView(entry: providerEntry, metric: self.entry.metric)
             } else {
                 self.emptyState
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .containerBackground(.fill.tertiary, for: .widget)
     }
 
@@ -113,24 +113,22 @@ struct CodexBarSwitcherWidgetView: View {
     let entry: CodexBarSwitcherEntry
 
     var body: some View {
-        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider }
-        ZStack {
-            Color.black.opacity(0.02)
-            VStack(alignment: .leading, spacing: 10) {
-                ProviderSwitcherRow(
-                    providers: self.entry.availableProviders,
-                    selected: self.entry.provider,
-                    updatedAt: providerEntry?.updatedAt ?? Date(),
-                    compact: self.family == .systemSmall,
-                    showsTimestamp: self.family != .systemSmall)
-                if let providerEntry {
-                    self.content(providerEntry: providerEntry)
-                } else {
-                    self.emptyState
-                }
+        let providerEntry = self.entry.snapshot.entries.first { $0.provider == self.entry.provider.instanceID }
+        VStack(alignment: .leading, spacing: 10) {
+            ProviderSwitcherRow(
+                providers: self.entry.availableProviders,
+                selected: self.entry.provider,
+                updatedAt: providerEntry?.updatedAt ?? Date(),
+                compact: self.family == .systemSmall,
+                showsTimestamp: self.family != .systemSmall)
+            if let providerEntry {
+                self.content(providerEntry: providerEntry)
+            } else {
+                self.emptyState
             }
-            .padding(12)
         }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .containerBackground(.fill.tertiary, for: .widget)
         .environment(\.widgetUsageShowsUsed, self.entry.snapshot.usageBarsShowUsed)
     }
@@ -209,7 +207,10 @@ enum CompactMetricFormatter {
             } ?? "—"
             let detail = entry.tokenUsage?.sessionTokens.map(WidgetFormat.tokenCount)
             let label = entry.tokenUsage.map {
-                WidgetFormat.tokenRowTitle("\($0.sessionLabel) cost", summary: $0, entryUpdatedAt: entry.updatedAt)
+                WidgetFormat.tokenRowTitle(
+                    Self.costMetricLabel($0.sessionLabel, provider: entry.provider),
+                    summary: $0,
+                    entryUpdatedAt: entry.updatedAt)
             } ?? "Today cost"
             return CompactMetricDisplay(value: value, label: label, detail: detail)
         case .last30DaysCost:
@@ -218,10 +219,22 @@ enum CompactMetricFormatter {
             } ?? "—"
             let detail = entry.tokenUsage?.last30DaysTokens.map(WidgetFormat.tokenCount)
             let label = entry.tokenUsage.map {
-                WidgetFormat.tokenRowTitle("\($0.last30DaysLabel) cost", summary: $0, entryUpdatedAt: entry.updatedAt)
+                WidgetFormat.tokenRowTitle(
+                    Self.costMetricLabel($0.last30DaysLabel, provider: entry.provider),
+                    summary: $0,
+                    entryUpdatedAt: entry.updatedAt)
             } ?? "30d cost"
             return CompactMetricDisplay(value: value, label: label, detail: detail)
         }
+    }
+
+    static func costMetricLabel(_ label: String, provider: ProviderInstanceID) -> String {
+        // Provider-specific by design: old Codex widget timelines lack the API-estimate billing disclaimer.
+        guard provider == .codex else { return "\(label) cost" }
+        // Existing widget timelines may predate the estimate labels. Do not leave a bare
+        // dollar value until the app next republishes it.
+        guard !label.contains("API est.") else { return label }
+        return "\(label) API est. · not billed"
     }
 }
 
@@ -258,7 +271,7 @@ private struct ProviderSwitchChip: View {
     var body: some View {
         let label = self.compact ? self.shortLabel : self.longLabel
         let background = self.selected
-            ? WidgetColors.color(for: self.provider).opacity(0.2)
+            ? WidgetColors.color(for: self.provider.instanceID).opacity(0.2)
             : Color.primary.opacity(0.08)
 
         if let choice = ProviderChoice(provider: self.provider) {
@@ -286,66 +299,7 @@ private struct ProviderSwitchChip: View {
     }
 
     private var shortLabel: String {
-        switch self.provider {
-        case .codex: "Codex"
-        case .openai: "OpenAI"
-        case .azureopenai: "Azure OpenAI"
-        case .claude: "Claude"
-        case .gemini: "Gemini"
-        case .antigravity: "Anti"
-        case .cursor: "Cursor"
-        case .opencode: "OpenCode"
-        case .opencodego: "OpenCode Go"
-        case .alibaba: "Alibaba"
-        case .alibabatokenplan: "Token Plan"
-        case .zai: "z.ai"
-        case .factory: "Droid"
-        case .copilot: "Copilot"
-        case .devin: "Devin"
-        case .minimax: "MiniMax"
-        case .manus: "Manus"
-        case .vertexai: "Vertex"
-        case .kilo: "Kilo"
-        case .kiro: "Kiro"
-        case .augment: "Augment"
-        case .jetbrains: "JetBrains"
-        case .kimi: "Kimi"
-        case .kimik2: "Kimi K2"
-        case .moonshot: "Moonshot"
-        case .amp: "Amp"
-        case .t3chat: "T3 Chat"
-        case .ollama: "Ollama"
-        case .synthetic: "Synthetic"
-        case .openrouter: "OpenRouter"
-        case .crossmodel: "CrossModel"
-        case .clawrouter: "ClawRouter"
-        case .wayfinder: "Wayfinder"
-        case .elevenlabs: "ElevenLabs"
-        case .warp: "Warp"
-        case .windsurf: "Windsurf"
-        case .perplexity: "Pplx"
-        case .mimo: "MiMo"
-        case .doubao: "Doubao"
-        case .sakana: "Sakana"
-        case .abacus: "Abacus"
-        case .mistral: "Mistral"
-        case .deepseek: "DeepSeek"
-        case .codebuff: "Codebuff"
-        case .crof: "Crof"
-        case .venice: "Venice"
-        case .commandcode: "Command Code"
-        case .qoder: "Qoder"
-        case .stepfun: "StepFun"
-        case .bedrock: "Bedrock"
-        case .grok: "Grok"
-        case .groq: "Groq"
-        case .llmproxy: "LLM Proxy"
-        case .litellm: "LiteLLM"
-        case .deepgram: "Deepgram"
-        case .poe: "Poe"
-        case .chutes: "Chutes"
-        case .zed: "Zed"
-        }
+        ProviderDefaults.metadata[self.provider]?.shortDisplayName ?? self.provider.rawValue.capitalized
     }
 }
 
@@ -620,27 +574,21 @@ struct WidgetUsageRow: Identifiable, Equatable {
     }
 
     static func smallWidgetRowLimit(for entry: WidgetSnapshot.ProviderEntry) -> Int? {
-        if entry.provider == .kimi { return 3 }
-        return self.antigravityQuotaSummaryRowLimit(for: entry, limit: 2)
+        self.widgetRowLimit(for: entry, family: .small)
     }
 
     static func mediumWidgetRowLimit(for entry: WidgetSnapshot.ProviderEntry) -> Int? {
-        if entry.provider == .kimi { return 3 }
-        return self.antigravityQuotaSummaryRowLimit(for: entry, limit: 3)
+        self.widgetRowLimit(for: entry, family: .medium)
     }
 
-    private static func antigravityQuotaSummaryRowLimit(
+    private static func widgetRowLimit(
         for entry: WidgetSnapshot.ProviderEntry,
-        limit: Int) -> Int?
+        family: ProviderWidgetFamily) -> Int?
     {
-        guard entry.provider == .antigravity,
-              entry.usageRows?.contains(where: {
-                  $0.id.hasPrefix("antigravity-quota-summary-")
-              }) == true
-        else {
-            return nil
-        }
-        return limit
+        guard let provider = entry.provider.firstPartyProvider else { return nil }
+        return ProviderDescriptorRegistry.descriptor(for: provider).presentation.widgetRowLimit(
+            rows: entry.usageRows,
+            family: family)
     }
 
     static func rows(
@@ -674,7 +622,7 @@ struct WidgetUsageRow: Identifiable, Equatable {
                 provider: entry.provider,
                 now: now)
         } else {
-            let metadata = ProviderDefaults.metadata[entry.provider]
+            let metadata = entry.provider.firstPartyProvider.flatMap { ProviderDefaults.metadata[$0] }
             var defaultRows = [
                 WidgetUsageRow(
                     id: "primary",
@@ -694,6 +642,7 @@ struct WidgetUsageRow: Identifiable, Equatable {
             rows = defaultRows.filter { $0.percentLeft != nil }
         }
         guard let limit else { return rows }
+        // Provider-specific by design: Antigravity medium widgets select one constrained row per model family.
         if entry.provider == .antigravity,
            limit >= 2,
            rows.contains(where: { $0.id.hasPrefix("antigravity-quota-summary-") })
@@ -728,9 +677,10 @@ struct WidgetUsageRow: Identifiable, Equatable {
     private static func applyingCodexWeeklyCap(
         _ rows: [WidgetUsageRow],
         snapshots: [WidgetSnapshot.WidgetUsageRowSnapshot],
-        provider: UsageProvider,
+        provider: ProviderInstanceID,
         now: Date) -> [WidgetUsageRow]
     {
+        // Provider-specific by design: Codex weekly exhaustion suppresses its paired legacy session widget row.
         guard provider == .codex,
               let weekly = snapshots.first(where: { $0.id == "weekly" })?.window,
               weekly.remainingPercent <= 0,
@@ -748,6 +698,7 @@ struct WidgetUsageRow: Identifiable, Equatable {
         for rowID: String,
         entry: WidgetSnapshot.ProviderEntry) -> RateWindow?
     {
+        // Provider-specific by design: old Codex timelines reconstruct session/weekly windows by duration.
         guard entry.provider == .codex else { return nil }
         let candidates = [(entry.primary, "session"), (entry.secondary, "weekly")]
         for (window, fallbackID) in candidates {
@@ -776,6 +727,7 @@ struct WidgetUsageRow: Identifiable, Equatable {
     }
 
     private static func antigravityQuotaFamily(for row: WidgetUsageRow) -> AntigravityQuotaFamily? {
+        // Provider-specific by design: Antigravity IDs/titles classify Gemini versus third-party quota families.
         guard row.id.hasPrefix("antigravity-quota-summary-") else { return nil }
         let id = row.id.lowercased()
         if id.contains("gemini") {
@@ -855,12 +807,13 @@ private struct HistoryView: View {
 }
 
 private struct HeaderView: View {
-    let provider: UsageProvider
+    let provider: ProviderInstanceID
     let updatedAt: Date
 
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text(ProviderDefaults.metadata[self.provider]?.displayName ?? self.provider.rawValue.capitalized)
+            Text(self.provider.firstPartyProvider.flatMap { ProviderDefaults.metadata[$0]?.displayName }
+                ?? self.provider.rawValue.capitalized)
                 .font(.body)
                 .fontWeight(.semibold)
             Spacer()
@@ -909,8 +862,16 @@ private struct ValueLine: View {
             Text(self.title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             Text(self.value)
                 .font(.caption)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .allowsTightening(true)
+                .layoutPriority(1)
         }
     }
 }
@@ -923,7 +884,9 @@ private struct UsageHistoryChart: View {
     var body: some View {
         let isCostMode = UsageHistoryChartMode.isCostMode(self.points)
         let values = self.points.map { point -> Double in
-            if isCostMode { return point.costUSD ?? 0 }
+            if isCostMode {
+                return point.costUSD ?? 0
+            }
             return Double(point.totalTokens ?? 0)
         }
         let scale = UsageChartScale(values: values)
@@ -963,124 +926,10 @@ enum UsageHistoryChartMode {
 }
 
 enum WidgetColors {
-    // swiftlint:disable:next cyclomatic_complexity
-    static func color(for provider: UsageProvider) -> Color {
-        switch provider {
-        case .codex:
-            Color(red: 73 / 255, green: 163 / 255, blue: 176 / 255)
-        case .openai:
-            Color(red: 15 / 255, green: 130 / 255, blue: 110 / 255)
-        case .azureopenai:
-            Color(red: 0, green: 120 / 255, blue: 212 / 255)
-        case .claude:
-            Color(red: 204 / 255, green: 124 / 255, blue: 94 / 255)
-        case .gemini:
-            Color(red: 171 / 255, green: 135 / 255, blue: 234 / 255)
-        case .antigravity:
-            Color(red: 96 / 255, green: 186 / 255, blue: 126 / 255)
-        case .cursor:
-            Color(red: 0 / 255, green: 191 / 255, blue: 165 / 255) // #00BFA5 - Cursor teal
-        case .opencode:
-            Color(red: 59 / 255, green: 130 / 255, blue: 246 / 255)
-        case .opencodego:
-            Color(red: 59 / 255, green: 130 / 255, blue: 246 / 255)
-        case .alibaba, .alibabatokenplan:
-            Color(red: 1.0, green: 106 / 255, blue: 0)
-        case .zai:
-            Color(red: 232 / 255, green: 90 / 255, blue: 106 / 255)
-        case .factory:
-            Color(red: 255 / 255, green: 107 / 255, blue: 53 / 255) // Factory orange
-        case .copilot:
-            Color(red: 168 / 255, green: 85 / 255, blue: 247 / 255) // Purple
-        case .devin:
-            Color(red: 70 / 255, green: 180 / 255, blue: 130 / 255)
-        case .minimax:
-            Color(red: 254 / 255, green: 96 / 255, blue: 60 / 255)
-        case .manus:
-            Color(red: 24 / 255, green: 24 / 255, blue: 24 / 255)
-        case .vertexai:
-            Color(red: 66 / 255, green: 133 / 255, blue: 244 / 255) // Google Blue
-        case .kilo:
-            Color(red: 242 / 255, green: 112 / 255, blue: 39 / 255) // Kilo orange
-        case .kiro:
-            Color(red: 255 / 255, green: 153 / 255, blue: 0 / 255) // AWS orange
-        case .augment:
-            Color(red: 99 / 255, green: 102 / 255, blue: 241 / 255) // Augment purple
-        case .jetbrains:
-            Color(red: 255 / 255, green: 51 / 255, blue: 153 / 255) // JetBrains pink
-        case .kimi:
-            Color(red: 254 / 255, green: 96 / 255, blue: 60 / 255) // Kimi orange
-        case .kimik2:
-            Color(red: 76 / 255, green: 0 / 255, blue: 255 / 255) // Kimi K2 purple
-        case .moonshot:
-            Color(red: 32 / 255, green: 93 / 255, blue: 235 / 255)
-        case .amp:
-            Color(red: 220 / 255, green: 38 / 255, blue: 38 / 255) // Amp red
-        case .t3chat:
-            Color(red: 245 / 255, green: 102 / 255, blue: 71 / 255)
-        case .ollama:
-            Color(red: 32 / 255, green: 32 / 255, blue: 32 / 255) // Ollama charcoal
-        case .synthetic:
-            Color(red: 20 / 255, green: 20 / 255, blue: 20 / 255) // Synthetic charcoal
-        case .openrouter:
-            Color(red: 111 / 255, green: 66 / 255, blue: 193 / 255) // OpenRouter purple
-        case .crossmodel:
-            Color(red: 124 / 255, green: 58 / 255, blue: 237 / 255) // CrossModel purple
-        case .clawrouter:
-            Color(red: 89 / 255, green: 110 / 255, blue: 246 / 255)
-        case .wayfinder:
-            Color(red: 16 / 255, green: 163 / 255, blue: 127 / 255)
-        case .elevenlabs:
-            Color(red: 235 / 255, green: 235 / 255, blue: 230 / 255)
-        case .warp:
-            Color(red: 147 / 255, green: 139 / 255, blue: 180 / 255)
-        case .windsurf:
-            Color(red: 52 / 255, green: 232 / 255, blue: 187 / 255) // Windsurf #34e8bb
-        case .perplexity:
-            Color(red: 32 / 255, green: 178 / 255, blue: 170 / 255) // Perplexity teal
-        case .mimo:
-            Color(red: 1.0, green: 105 / 255, blue: 0)
-        case .doubao:
-            Color(red: 45 / 255, green: 136 / 255, blue: 255 / 255) // Doubao blue
-        case .sakana:
-            Color(red: 41 / 255, green: 117 / 255, blue: 219 / 255)
-        case .abacus:
-            Color(red: 56 / 255, green: 189 / 255, blue: 248 / 255)
-        case .mistral:
-            Color(red: 255 / 255, green: 80 / 255, blue: 15 / 255) // Mistral orange
-        case .deepseek:
-            Color(red: 82 / 255, green: 125 / 255, blue: 240 / 255)
-        case .codebuff:
-            Color(red: 68 / 255, green: 255 / 255, blue: 0 / 255) // Codebuff lime
-        case .crof:
-            Color(red: 46 / 255, green: 171 / 255, blue: 148 / 255)
-        case .venice:
-            Color(red: 51 / 255, green: 153 / 255, blue: 1.0)
-        case .commandcode:
-            Color(red: 0, green: 0, blue: 0)
-        case .qoder:
-            Color(red: 16 / 255, green: 185 / 255, blue: 129 / 255)
-        case .stepfun:
-            Color(red: 255 / 255, green: 140 / 255, blue: 0 / 255) // StepFun orange
-        case .bedrock:
-            Color(red: 255 / 255, green: 153 / 255, blue: 0 / 255) // AWS orange
-        case .grok:
-            Color(red: 16 / 255, green: 163 / 255, blue: 127 / 255) // Grok teal
-        case .groq:
-            Color(red: 245 / 255, green: 104 / 255, blue: 68 / 255)
-        case .llmproxy:
-            Color(red: 36 / 255, green: 180 / 255, blue: 126 / 255)
-        case .litellm:
-            Color(red: 76 / 255, green: 137 / 255, blue: 240 / 255)
-        case .deepgram:
-            Color(red: 10 / 255, green: 18 / 255, blue: 27 / 255)
-        case .poe:
-            Color(red: 93 / 255, green: 92 / 255, blue: 222 / 255) // Poe purple
-        case .chutes:
-            Color(red: 24 / 255, green: 160 / 255, blue: 88 / 255)
-        case .zed:
-            Color(red: 64 / 255, green: 156 / 255, blue: 255 / 255)
-        }
+    static func color(for instanceID: ProviderInstanceID) -> Color {
+        guard let provider = instanceID.firstPartyProvider else { return .secondary }
+        let color = ProviderDescriptorRegistry.descriptor(for: provider).branding.widgetColor
+        return Color(red: color.red, green: color.green, blue: color.blue)
     }
 }
 
@@ -1091,6 +940,7 @@ struct WidgetBalanceLine: Equatable {
 
 enum WidgetBalanceFormatter {
     static func extraUsageCost(for entry: WidgetSnapshot.ProviderEntry) -> ProviderCostSnapshot? {
+        // Provider-specific by design: Devin encodes its extra-usage balance as a named provider-cost period.
         guard entry.provider == .devin,
               let cost = entry.providerCost,
               cost.period == "Extra usage balance"
@@ -1143,11 +993,7 @@ enum WidgetFormat {
     }
 
     static func tokenCount(_ value: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.maximumFractionDigits = 0
-        let raw = formatter.string(from: NSNumber(value: value)) ?? "\(value)"
-        return "\(raw) tokens"
+        "\(UsageFormatter.tokenCountString(value)) tokens"
     }
 
     static func relativeDate(_ date: Date) -> String {
