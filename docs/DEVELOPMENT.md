@@ -63,7 +63,8 @@ browser-cookie web path. The web path reuses cached cookies when possible and im
 the cache is missing or rejected.
 
 ### Refresh Frequency
-- Default: Every 5 minutes (configurable in Preferences → General)
+- Fresh-install default: Adaptive, between 2 and 30 minutes (configurable in Preferences → General). Existing installs
+  without a stored cadence retain the legacy 5-minute fallback.
 - Minimum: 1 minute
 - Cookie import happens automatically when cached cookies need refresh
 
@@ -106,7 +107,7 @@ CodexBar/
 ## Common Tasks
 
 ### Add a New Provider
-See the canonical [provider authoring guide](provider.md#adding-a-new-provider-current-flow) for the complete flow.
+See the canonical [provider authoring guide](provider.md#adding-a-new-provider) for the complete flow.
 
 1. Add the provider identity to `Sources/CodexBarCore/Providers/Providers.swift`.
 2. Add the descriptor and the fetcher, parser, settings-reader, or status-probe pieces the provider needs under

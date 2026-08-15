@@ -8,6 +8,105 @@ import Glibc
 #endif
 
 struct SpawnedProcessGroupTests {
+    #if DEBUG
+    @Test
+    func `owned descriptor take discard and deinit are one shot`() throws {
+        func makePipe() throws -> (read: Int32, write: Int32) {
+            var descriptors = [Int32](repeating: -1, count: 2)
+            try #require(pipe(&descriptors) == 0)
+            return (descriptors[0], descriptors[1])
+        }
+
+        func expectEOF(_ readDescriptor: Int32) {
+            let flags = fcntl(readDescriptor, F_GETFL)
+            #expect(flags >= 0)
+            #expect(fcntl(readDescriptor, F_SETFL, flags | O_NONBLOCK) == 0)
+            var byte: UInt8 = 0
+            #expect(read(readDescriptor, &byte, 1) == 0)
+        }
+
+        let transferredPipe = try makePipe()
+        defer { _ = close(transferredPipe.read) }
+        let transferred = SpawnedProcessGroup._test_ownedDescriptorTakeOnce(
+            ownedFileDescriptor: transferredPipe.write)
+        let transferredDescriptor = try #require(transferred.first)
+        #expect(transferred.second == nil)
+        #expect(!transferred.discardAfterTake)
+        _ = close(transferredDescriptor)
+        expectEOF(transferredPipe.read)
+
+        let discardedPipe = try makePipe()
+        defer { _ = close(discardedPipe.read) }
+        let discarded = SpawnedProcessGroup._test_ownedDescriptorDiscardTwice(
+            ownedFileDescriptor: discardedPipe.write)
+        #expect(discarded.first)
+        #expect(!discarded.second)
+        expectEOF(discardedPipe.read)
+
+        let deinitPipe = try makePipe()
+        defer { _ = close(deinitPipe.read) }
+        SpawnedProcessGroup._test_ownedDescriptorDeinit(ownedFileDescriptor: deinitPipe.write)
+        expectEOF(deinitPipe.read)
+    }
+
+    @Test
+    func `PTY descriptor reservation failure prevents child launch`() throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexbar-pty-reservation-\(UUID().uuidString).marker")
+        defer { try? FileManager.default.removeItem(at: marker) }
+
+        var primaryFD: Int32 = -1
+        var secondaryFD: Int32 = -1
+        try #require(openpty(&primaryFD, &secondaryFD, nil, nil, nil) == 0)
+        defer {
+            _ = close(primaryFD)
+            _ = close(secondaryFD)
+        }
+
+        do {
+            _ = try SpawnedProcessGroup.withPTYPrimaryDescriptorReservationFailureForTesting {
+                try SpawnedProcessGroup.launchPTY(
+                    binary: "/usr/bin/python3",
+                    arguments: ["-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", marker.path],
+                    environment: ProcessInfo.processInfo.environment,
+                    workingDirectory: nil,
+                    fileDescriptors: (primary: primaryFD, secondary: secondaryFD))
+            }
+            Issue.record("Expected PTY descriptor reservation to fail")
+        } catch let SpawnedProcessGroup.LaunchError.setupFailed(details) {
+            #expect(details == "reserve PTY primary descriptor")
+        } catch {
+            Issue.record("Unexpected launch error: \(error)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test
+    func `output holder cleanup lease expires closes descriptor and disarms cleanup`() throws {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        try #require(pipe(&descriptors) == 0)
+        let readDescriptor = descriptors[0]
+        let leasedWriteDescriptor = descriptors[1]
+        defer { _ = close(readDescriptor) }
+
+        let start = Date()
+        let result = SpawnedProcessGroup._test_outputHolderCleanupLeaseExpiry(
+            ownedFileDescriptor: leasedWriteDescriptor,
+            maxLifetime: 0.05,
+            waitTimeout: 0.5)
+        let elapsed = Date().timeIntervalSince(start)
+
+        #expect(result.completed)
+        #expect(!result.active)
+        #expect(elapsed < 0.5)
+        let flags = fcntl(readDescriptor, F_GETFL)
+        #expect(flags >= 0)
+        #expect(fcntl(readDescriptor, F_SETFL, flags | O_NONBLOCK) == 0)
+        var byte: UInt8 = 0
+        #expect(read(readDescriptor, &byte, 1) == 0)
+    }
+    #endif
+
     @Test
     func `pipe cleanup preserves standard descriptors`() {
         let descriptors = SpawnedProcessGroup.pipeDescriptorsToClose([0, 1, 2, 3, 4, 3])
@@ -72,6 +171,81 @@ struct SpawnedProcessGroupTests {
     }
 
     @Test
+    func `launch clears the parent thread signal mask`() throws {
+        var blockedMask = sigset_t()
+        var previousMask = sigset_t()
+        sigemptyset(&blockedMask)
+        sigaddset(&blockedMask, SIGTERM)
+        try #require(pthread_sigmask(SIG_BLOCK, &blockedMask, &previousMask) == 0)
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        let script = """
+        import signal
+        import sys
+
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        sys.exit(1 if signal.SIGTERM in blocked else 0)
+        """
+        let process = try SpawnedProcessGroup.launch(
+            binary: "/usr/bin/python3",
+            arguments: ["-c", script],
+            environment: ProcessInfo.processInfo.environment,
+            stdoutPipe: stdoutPipe,
+            stderrPipe: stderrPipe)
+
+        while process.isRunning {
+            usleep(20000)
+        }
+        process.finishSynchronously()
+
+        #expect(process.terminationStatus == 0)
+    }
+
+    @Test
+    func `PTY launch clears the parent thread signal mask`() throws {
+        var blockedMask = sigset_t()
+        var previousMask = sigset_t()
+        sigemptyset(&blockedMask)
+        sigaddset(&blockedMask, SIGTERM)
+        try #require(pthread_sigmask(SIG_BLOCK, &blockedMask, &previousMask) == 0)
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+
+        var primaryFD: Int32 = -1
+        var secondaryFD: Int32 = -1
+        try #require(openpty(&primaryFD, &secondaryFD, nil, nil, nil) == 0)
+        let primaryHandle = FileHandle(fileDescriptor: primaryFD, closeOnDealloc: true)
+        let secondaryHandle = FileHandle(fileDescriptor: secondaryFD, closeOnDealloc: true)
+        defer {
+            try? primaryHandle.close()
+            try? secondaryHandle.close()
+        }
+
+        let script = """
+        import signal
+        import sys
+
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        sys.exit(1 if signal.SIGTERM in blocked else 0)
+        """
+        let process = try SpawnedProcessGroup.launchPTY(
+            binary: "/usr/bin/python3",
+            arguments: ["-c", script],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil,
+            fileDescriptors: (primary: primaryFD, secondary: secondaryFD))
+        try? secondaryHandle.close()
+
+        while process.isRunning {
+            usleep(20000)
+        }
+        process.finishSynchronously()
+
+        #expect(process.terminationStatus == 0)
+    }
+
+    @Test
     func `launch closes unrelated parent descriptors`() async throws {
         let sourceFD = open("/dev/null", O_RDONLY)
         let inheritedFD = fcntl(sourceFD, F_DUPFD, 200)
@@ -118,12 +292,12 @@ struct SpawnedProcessGroupTests {
             [
                 sys.executable,
                 "-c",
-                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+                "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)",
+                sys.argv[1],
             ],
             start_new_session=True,
         )
-        with open(sys.argv[1], "w") as handle:
-            handle.write(str(child.pid))
         time.sleep(30)
         """
         let stdoutPipe = Pipe()

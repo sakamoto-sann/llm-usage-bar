@@ -4,6 +4,43 @@ import Testing
 
 struct ConfigValidationTests {
     @Test
+    func `reports unsafe hook rule fields`() {
+        let invalidRules = [
+            HookRule(id: "duplicate", event: .quotaLow, provider: "unknown", threshold: 1.1, executable: "echo"),
+            HookRule(
+                id: "duplicate",
+                event: .quotaReached,
+                executable: "/bin/echo",
+                timeoutSeconds: 301),
+        ]
+        let config = CodexBarConfig(
+            providers: [ProviderConfig(id: .codex)],
+            hooks: HooksConfig(enabled: true, events: invalidRules))
+        let codes = Set(CodexBarConfigValidator.validate(config).map(\.code))
+
+        #expect(codes.contains("invalid_hook_executable"))
+        #expect(codes.contains("invalid_hook_provider"))
+        #expect(codes.contains("invalid_hook_threshold"))
+        #expect(codes.contains("invalid_hook_timeout"))
+        #expect(codes.contains("duplicate_hook_id"))
+    }
+
+    @Test
+    func `reports hook workload limits`() {
+        let oversized = HookRule(
+            id: String(repeating: "i", count: HookRule.maximumIDBytes + 1),
+            event: .quotaReached,
+            executable: "/bin/echo",
+            arguments: Array(repeating: "x", count: HookRule.maximumArgumentCount + 1))
+        let rules = Array(repeating: oversized, count: HooksConfig.maximumRuleCount + 1)
+        let config = CodexBarConfig(providers: [], hooks: HooksConfig(enabled: true, events: rules))
+        let codes = Set(CodexBarConfigValidator.validate(config).map(\.code))
+
+        #expect(codes.contains("too_many_hook_rules"))
+        #expect(codes.contains("invalid_hook_command_size"))
+    }
+
+    @Test
     func `fresh config defaults Alibaba Token Plan to International`() throws {
         let config = CodexBarConfig.makeDefault()
         let provider = try #require(config.providerConfig(for: .alibabatokenplan))
@@ -53,6 +90,17 @@ struct ConfigValidationTests {
     }
 
     @Test
+    func `accepts legacy factory cli source as compatibility alias`() {
+        var config = CodexBarConfig.makeDefault()
+        config.setProviderConfig(ProviderConfig(id: .factory, source: .cli))
+        let issues = CodexBarConfigValidator.validate(config)
+        #expect(!issues.contains(where: {
+            $0.provider == .factory && $0.code == "unsupported_source"
+        }))
+        #expect(FactoryProviderDescriptor.descriptor.fetchPlan.sourceModes.contains(.cli))
+    }
+
+    @Test
     func `reports missing API key when source API`() {
         var config = CodexBarConfig.makeDefault()
         config.setProviderConfig(ProviderConfig(id: .zai, source: .api, apiKey: nil))
@@ -70,6 +118,96 @@ struct ConfigValidationTests {
         let issues = CodexBarConfigValidator.validate(config)
 
         #expect(!issues.contains(where: { $0.provider == .wayfinder && $0.code == "api_key_missing" }))
+    }
+
+    @Test
+    func `sub2api token accounts satisfy API credentials`() {
+        let accounts = ProviderTokenAccountData(
+            version: 1,
+            accounts: [
+                ProviderTokenAccount(
+                    id: UUID(),
+                    label: "Primary",
+                    token: "fixture",
+                    addedAt: 0,
+                    lastUsed: nil),
+            ],
+            activeIndex: 0)
+        var config = CodexBarConfig.makeDefault()
+        config.setProviderConfig(ProviderConfig(
+            id: .sub2api,
+            source: .api,
+            enterpriseHost: "https://sub2api.example.com",
+            tokenAccounts: accounts))
+        let issues = CodexBarConfigValidator.validate(config)
+
+        #expect(!issues.contains(where: { $0.provider == .sub2api && $0.code == "api_key_missing" }))
+    }
+
+    @Test
+    func `sub2api accepts HTTPS and loopback HTTP base URLs`() {
+        for host in ["https://sub2api.example.com", "http://127.0.0.1:8080"] {
+            var config = CodexBarConfig.makeDefault()
+            config.setProviderConfig(ProviderConfig(
+                id: .sub2api,
+                source: .api,
+                apiKey: "fixture",
+                enterpriseHost: host))
+            let invalidHostIssue = CodexBarConfigValidator.validate(config).first { issue in
+                issue.provider == .sub2api && issue.code == "invalid_enterprise_host"
+            }
+
+            #expect(invalidHostIssue == nil)
+        }
+    }
+
+    @Test
+    func `sub2api rejects unsafe base URLs`() {
+        let invalidHosts = [
+            "http://sub2api.example.com",
+            "https://user:pass@sub2api.example.com",
+            "https://sub2api.example.com?token=secret",
+            "https://sub2api.example.com#fragment",
+        ]
+        for host in invalidHosts {
+            var config = CodexBarConfig.makeDefault()
+            config.setProviderConfig(ProviderConfig(
+                id: .sub2api,
+                source: .api,
+                apiKey: "fixture",
+                enterpriseHost: host))
+            let invalidHostIssue = CodexBarConfigValidator.validate(config).first { issue in
+                issue.provider == .sub2api &&
+                    issue.field == "enterpriseHost" &&
+                    issue.code == "invalid_enterprise_host"
+            }
+
+            #expect(invalidHostIssue != nil)
+        }
+    }
+
+    @Test
+    func `sub2api rejects blank token accounts as API credentials`() {
+        let accounts = ProviderTokenAccountData(
+            version: 1,
+            accounts: [
+                ProviderTokenAccount(
+                    id: UUID(),
+                    label: "Blank",
+                    token: "   ",
+                    addedAt: 0,
+                    lastUsed: nil),
+            ],
+            activeIndex: 0)
+        var config = CodexBarConfig.makeDefault()
+        config.setProviderConfig(ProviderConfig(
+            id: .sub2api,
+            source: .api,
+            enterpriseHost: "https://sub2api.example.com",
+            tokenAccounts: accounts))
+        let issues = CodexBarConfigValidator.validate(config)
+
+        #expect(issues.contains(where: { $0.provider == .sub2api && $0.code == "api_key_missing" }))
     }
 
     @Test
@@ -146,6 +284,19 @@ struct ConfigValidationTests {
     }
 
     @Test
+    func `allows OpenRouter endpoint`() {
+        var config = CodexBarConfig.makeDefault()
+        config.setProviderConfig(ProviderConfig(
+            id: .openrouter,
+            apiKey: "fixture",
+            enterpriseHost: "https://router.example.com/api/v1"))
+        let issues = CodexBarConfigValidator.validate(config)
+
+        #expect(!issues.contains(where: { $0.provider == .openrouter && $0.code == "enterprise_host_unused" }))
+        #expect(!issues.contains(where: { $0.provider == .openrouter && $0.code == "invalid_enterprise_host" }))
+    }
+
+    @Test
     func `unsupported enterprise host warning lists every supported provider`() throws {
         var config = CodexBarConfig.makeDefault()
         config.setProviderConfig(ProviderConfig(id: .gemini, enterpriseHost: "https://example.com"))
@@ -154,7 +305,8 @@ struct ConfigValidationTests {
         }))
 
         #expect(issue.message ==
-            "enterpriseHost is set but only azureopenai, clawrouter, copilot, kimi, litellm, llmproxy, and wayfinder " +
+            "enterpriseHost is set but only azureopenai, clawrouter, copilot, kimi, litellm, llmproxy, openrouter, " +
+            "sub2api, and wayfinder " +
             "support enterpriseHost.")
     }
 
@@ -208,12 +360,11 @@ struct ConfigValidationTests {
         var config = CodexBarConfig.makeDefault()
         config.setProviderConfig(ProviderConfig(id: .gemini, workspaceID: "workspace-123"))
         let issues = CodexBarConfigValidator.validate(config)
-        #expect(issues.contains(where: { $0.provider == .gemini && $0.code == "workspace_unused" }))
-        #expect(issues.contains(where: { issue in
-            issue.provider == .gemini &&
-                issue.code == "workspace_unused" &&
-                issue.message.contains("openai")
-        }))
+        let issue = issues.first { $0.provider == .gemini && $0.code == "workspace_unused" }
+        let expectedMessage =
+            "workspaceID is set but only azureopenai, openai, opencode, opencodego, devin, deepgram, and xai " +
+            "support workspaceID."
+        #expect(issue?.message == expectedMessage)
     }
 
     @Test

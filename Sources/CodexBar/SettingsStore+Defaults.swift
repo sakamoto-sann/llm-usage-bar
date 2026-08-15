@@ -12,10 +12,37 @@ extension SettingsStore {
     var refreshFrequency: RefreshFrequency {
         get { self.defaultsState.refreshFrequency }
         set {
+            let previousValue = self.defaultsState.refreshFrequency
+            if newValue == .adaptiveAgentAware,
+               previousValue != .adaptiveAgentAware,
+               self.defaultsState.adaptiveActivityScanConsent == .declined
+            {
+                self.defaultsState.adaptiveActivityScanConsent = .undecided
+                self.userDefaults.set(
+                    AdaptiveActivityScanConsent.undecided.rawValue,
+                    forKey: "adaptiveActivityScanConsent")
+            }
             self.defaultsState.refreshFrequency = newValue
             self.userDefaults.set(newValue.rawValue, forKey: "refreshFrequency")
             self.noteBackgroundWorkSettingsChanged()
         }
+    }
+
+    var adaptiveActivityScanConsent: AdaptiveActivityScanConsent {
+        get { self.defaultsState.adaptiveActivityScanConsent }
+        set {
+            self.defaultsState.adaptiveActivityScanConsent = newValue
+            self.userDefaults.set(newValue.rawValue, forKey: "adaptiveActivityScanConsent")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var adaptiveActivityScanningEnabled: Bool {
+        self.refreshFrequency == .adaptiveAgentAware && self.adaptiveActivityScanConsent == .allowed
+    }
+
+    var shouldRequestAdaptiveActivityScanConsent: Bool {
+        self.refreshFrequency == .adaptiveAgentAware && self.adaptiveActivityScanConsent == .undecided
     }
 
     /// When enabled, keeping the menu open through its short refresh delay fetches usage for every
@@ -282,6 +309,14 @@ extension SettingsStore {
         }
     }
 
+    var menuBarHighContrastOnInactiveDisplays: Bool {
+        get { self.defaultsState.menuBarHighContrastOnInactiveDisplays }
+        set {
+            self.defaultsState.menuBarHighContrastOnInactiveDisplays = newValue
+            self.userDefaults.set(newValue, forKey: "menuBarHighContrastOnInactiveDisplays")
+        }
+    }
+
     private var menuBarDisplayModeRaw: String? {
         get { self.defaultsState.menuBarDisplayModeRaw }
         set {
@@ -355,6 +390,108 @@ extension SettingsStore {
         }
     }
 
+    var menuBarLayout: MenuBarLayout {
+        get {
+            self.defaultsState.storedMenuBarLayout ?? MenuBarLayout.migrated(
+                iconStyle: self.menuBarIconStyle,
+                displayMode: self.menuBarDisplayMode,
+                metricPreference: .automatic,
+                resetTimeDisplayStyle: self.resetTimeDisplayStyle)
+        }
+        set {
+            self.defaultsState.storedMenuBarLayout = newValue
+            self.persistMenuBarLayout(newValue, key: "menuBarLayout")
+        }
+    }
+
+    var hasStoredMenuBarLayout: Bool {
+        self.defaultsState.storedMenuBarLayout != nil
+    }
+
+    var menuBarLayoutOverrides: [UsageProvider: MenuBarLayout] {
+        Dictionary(uniqueKeysWithValues: self.defaultsState.menuBarLayoutOverridesRaw.compactMap { key, value in
+            UsageProvider(rawValue: key).map { ($0, value) }
+        })
+    }
+
+    func menuBarLayout(for provider: UsageProvider) -> MenuBarLayout {
+        self.menuBarLayoutResolution(for: provider).layout
+    }
+
+    func menuBarLayoutForGlobalEditing(representativeProvider: UsageProvider?) -> MenuBarLayout {
+        if let stored = self.defaultsState.storedMenuBarLayout {
+            return stored
+        }
+        guard let representativeProvider else { return self.menuBarLayout }
+        return self.menuBarLayoutResolution(for: representativeProvider).layout
+    }
+
+    func menuBarLayoutResolution(for provider: UsageProvider) -> MenuBarLayoutResolution {
+        if let override = self.defaultsState.menuBarLayoutOverridesRaw[provider.rawValue] {
+            return .stored(override)
+        }
+        if let stored = self.defaultsState.storedMenuBarLayout {
+            return .stored(stored)
+        }
+        return .legacy(
+            iconStyle: self.menuBarIconStyle,
+            displayMode: self.menuBarDisplayMode,
+            metricPreference: self.menuBarMetricPreference(for: provider),
+            resetTimeDisplayStyle: self.resetTimeDisplayStyle,
+            provider: provider)
+    }
+
+    func setMenuBarLayout(_ layout: MenuBarLayout, for provider: UsageProvider?) {
+        if let provider {
+            self.defaultsState.menuBarLayoutOverridesRaw[provider.rawValue] = layout
+            self.persistMenuBarLayoutOverrides()
+        } else {
+            self.menuBarLayout = layout
+        }
+    }
+
+    func removeMenuBarLayoutOverride(for provider: UsageProvider) {
+        guard self.defaultsState.menuBarLayoutOverridesRaw.removeValue(forKey: provider.rawValue) != nil else { return }
+        self.persistMenuBarLayoutOverrides()
+    }
+
+    var menuBarLayoutSize: MenuBarLayoutSize {
+        get { MenuBarLayoutSize(rawValue: self.defaultsState.menuBarLayoutSizeRaw) ?? .regular }
+        set {
+            self.defaultsState.menuBarLayoutSizeRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "menuBarLayoutSize")
+        }
+    }
+
+    var menuBarLayoutGap: MenuBarLayoutGap {
+        get { MenuBarLayoutGap(rawValue: self.defaultsState.menuBarLayoutGapRaw) ?? .regular }
+        set {
+            self.defaultsState.menuBarLayoutGapRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "menuBarLayoutGap")
+        }
+    }
+
+    /// User-tunable vertical nudge for the menu bar title, clamped to -20...20.
+    /// Positive moves content up, negative moves it down; 0 keeps the optical default.
+    var menuBarLayoutVerticalAdjustment: Int {
+        get { self.defaultsState.menuBarLayoutVerticalAdjustment }
+        set {
+            let clamped = max(-20, min(20, newValue))
+            self.defaultsState.menuBarLayoutVerticalAdjustment = clamped
+            self.userDefaults.set(clamped, forKey: "menuBarLayoutVerticalAdjustment")
+        }
+    }
+
+    private func persistMenuBarLayout(_ layout: MenuBarLayout, key: String) {
+        guard let data = try? JSONEncoder().encode(layout) else { return }
+        self.userDefaults.set(data, forKey: key)
+    }
+
+    private func persistMenuBarLayoutOverrides() {
+        guard let data = try? JSONEncoder().encode(self.defaultsState.menuBarLayoutOverridesRaw) else { return }
+        self.userDefaults.set(data, forKey: "menuBarLayoutOverrides")
+    }
+
     var copilotIconSecondaryWindowIDRaw: String {
         get { self.defaultsState.copilotIconSecondaryWindowIDRaw }
         set {
@@ -366,8 +503,21 @@ extension SettingsStore {
     var costUsageEnabled: Bool {
         get { self.defaultsState.costUsageEnabled }
         set {
+            let changed = self.defaultsState.costUsageEnabled != newValue
             self.defaultsState.costUsageEnabled = newValue
             self.userDefaults.set(newValue, forKey: "tokenCostUsageEnabled")
+            if changed {
+                self.costUsageSettingsRevision &+= 1
+            }
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var codexLocalSessionCostLedgerEnabled: Bool {
+        get { self.defaultsState.codexLocalSessionCostLedgerEnabled }
+        set {
+            self.defaultsState.codexLocalSessionCostLedgerEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "codexLocalSessionCostLedgerEnabled")
             self.noteBackgroundWorkSettingsChanged()
         }
     }
@@ -376,8 +526,12 @@ extension SettingsStore {
         get { self.defaultsState.costUsageHistoryDays }
         set {
             let clamped = max(1, min(365, newValue))
+            let changed = self.defaultsState.costUsageHistoryDays != clamped
             self.defaultsState.costUsageHistoryDays = clamped
             self.userDefaults.set(clamped, forKey: "tokenCostUsageHistoryDays")
+            if changed {
+                self.costUsageSettingsRevision &+= 1
+            }
             self.noteBackgroundWorkSettingsChanged()
         }
     }
@@ -470,6 +624,30 @@ extension SettingsStore {
         }
     }
 
+    /// Explicit opt-in for reading Claude Code's own Keychain item (#2634). Feeds
+    /// `ClaudeOAuthDirectKeychainReadConsent`, the single consent source behind
+    /// `ClaudeOAuthCredentialsStore.keychainAccessAllowed`.
+    var claudeOAuthDirectKeychainReadAllowed: Bool {
+        get { self.defaultsState.claudeOAuthDirectKeychainReadAllowed }
+        set {
+            let wasAllowed = self.defaultsState.claudeOAuthDirectKeychainReadAllowed
+            self.defaultsState.claudeOAuthDirectKeychainReadAllowed = newValue
+            self.userDefaults.set(newValue, forKey: ClaudeOAuthDirectKeychainReadConsent.userDefaultsKey)
+            CodexBarLog.logger(LogCategories.settings).info(
+                "Claude direct Keychain read consent updated",
+                metadata: ["allowed": newValue ? "1" : "0"])
+            if wasAllowed, !newValue {
+                // Revoking consent must also revoke what consent obtained: credentials copied from Claude
+                // Code's Keychain while consent was on live in CodexBar's memory and Keychain caches, and
+                // those caches are consulted before the direct-read gate. Advance the global revocation epoch
+                // before dropping the active cache so previously used profile caches also fail closed on lookup
+                // (CodexBar-owned state only — Claude Code's item is untouched).
+                ClaudeOAuthCredentialsStore.revokeDirectKeychainReadConsent()
+            }
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
     var claudeOAuthPromptFreeCredentialsEnabled: Bool {
         get { self.claudeOAuthKeychainPromptMode == .never }
         set {
@@ -521,6 +699,14 @@ extension SettingsStore {
         }
     }
 
+    var claudeDailyRoutinesUsageVisible: Bool {
+        get { self.defaultsState.claudeDailyRoutinesUsageVisible }
+        set {
+            self.defaultsState.claudeDailyRoutinesUsageVisible = newValue
+            self.userDefaults.set(newValue, forKey: "claudeDailyRoutinesUsageVisible")
+        }
+    }
+
     var codexSparkUsageVisible: Bool {
         get { self.defaultsState.codexSparkUsageVisible }
         set {
@@ -551,6 +737,22 @@ extension SettingsStore {
                 metadata: ["enabled": newValue ? "1" : "0"])
             self.noteBackgroundWorkSettingsChanged()
         }
+    }
+
+    var backgroundWorkLowPowerModeEnabled: Bool {
+        get { self.defaultsState.backgroundWorkLowPowerModeEnabled }
+        set {
+            self.defaultsState.backgroundWorkLowPowerModeEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "backgroundWorkLowPowerModeEnabled")
+            CodexBarLog.logger(LogCategories.settings).info(
+                "Background work low power mode updated",
+                metadata: ["enabled": newValue ? "1" : "0"])
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var effectiveOpenAIWebBatterySaverEnabled: Bool {
+        self.openAIWebBatterySaverEnabled || self.backgroundWorkLowPowerModeEnabled
     }
 
     var providerStorageFootprintsEnabled: Bool {
@@ -617,8 +819,8 @@ extension SettingsStore {
         }
     }
 
-    var selectedMenuProvider: UsageProvider? {
-        get { self.selectedMenuProviderRaw.flatMap(UsageProvider.init(rawValue:)) }
+    var selectedMenuProvider: ProviderInstanceID? {
+        get { self.selectedMenuProviderRaw.flatMap(ProviderInstanceID.init(rawValue:)) }
         set {
             self.selectedMenuProviderRaw = newValue?.rawValue
         }
@@ -829,11 +1031,27 @@ extension SettingsStore {
         }
     }
 
+    var agentSessionLabelStyle: AgentSessionLabelStyle {
+        get { AgentSessionLabelStyle(rawValue: self.defaultsState.agentSessionLabelStyleRaw) ?? .project }
+        set {
+            self.defaultsState.agentSessionLabelStyleRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "agentSessionLabelStyle")
+        }
+    }
+
     var agentSessionsManualHosts: String {
         get { self.defaultsState.agentSessionsManualHosts }
         set {
             self.defaultsState.agentSessionsManualHosts = newValue
             self.userDefaults.set(newValue, forKey: "agentSessionsManualHosts")
+        }
+    }
+
+    var preferredCurrencyCode: String {
+        get { self.defaultsState.preferredCurrencyCode }
+        set {
+            self.defaultsState.preferredCurrencyCode = newValue
+            self.userDefaults.set(newValue, forKey: "preferredCurrencyCode")
         }
     }
 }
@@ -845,7 +1063,9 @@ extension SettingsStore {
         for provider in providers where !seen.contains(provider) {
             seen.insert(provider)
             normalized.append(provider)
-            if let maxCount, normalized.count >= maxCount { break }
+            if let maxCount, normalized.count >= maxCount {
+                break
+            }
         }
         return normalized
     }

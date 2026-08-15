@@ -7,50 +7,6 @@ import Testing
 @MainActor
 struct ProviderIconResourcesTests {
     @Test
-    func `provider icon SV gs exist`() throws {
-        let root = try Self.repoRoot()
-        let resources = root.appending(path: "Sources/CodexBar/Resources", directoryHint: .isDirectory)
-
-        let slugs = [
-            "codex",
-            "claude",
-            "zai",
-            "minimax",
-            "cursor",
-            "opencode",
-            "opencodego",
-            "alibaba",
-            "gemini",
-            "antigravity",
-            "factory",
-            "copilot",
-            "devin",
-            "crof",
-            "commandcode",
-            "t3chat",
-            "kimi",
-            "bedrock",
-            "elevenlabs",
-            "groq",
-            "llmproxy",
-            "litellm",
-            "deepgram",
-            "ollama",
-            "clawrouter",
-            "wayfinder",
-        ]
-        for slug in slugs {
-            let url = resources.appending(path: "ProviderIcon-\(slug).svg")
-            #expect(
-                FileManager.default.fileExists(atPath: url.path(percentEncoded: false)),
-                "Missing SVG for \(slug)")
-
-            let image = NSImage(contentsOf: url)
-            #expect(image != nil, "Could not load SVG as NSImage for \(slug)")
-        }
-    }
-
-    @Test
     func `groq and grok provider icons are distinct`() throws {
         let root = try Self.repoRoot()
         let resources = root.appending(path: "Sources/CodexBar/Resources", directoryHint: .isDirectory)
@@ -58,6 +14,16 @@ struct ProviderIconResourcesTests {
         let grok = try String(contentsOf: resources.appending(path: "ProviderIcon-grok.svg"), encoding: .utf8)
 
         #expect(groq != grok)
+    }
+
+    @Test
+    func `grok and xai provider icons are distinct`() throws {
+        let root = try Self.repoRoot()
+        let resources = root.appending(path: "Sources/CodexBar/Resources", directoryHint: .isDirectory)
+        let grok = try String(contentsOf: resources.appending(path: "ProviderIcon-grok.svg"), encoding: .utf8)
+        let xai = try String(contentsOf: resources.appending(path: "ProviderIcon-xai.svg"), encoding: .utf8)
+
+        #expect(grok != xai)
     }
 
     @Test
@@ -69,7 +35,7 @@ struct ProviderIconResourcesTests {
         let second = try #require(ProviderBrandIcon.image(for: .codex))
 
         #expect(first === second)
-        #expect(first.size == NSSize(width: 16, height: 16))
+        #expect(first.size == NSSize(width: 18, height: 18))
         #expect(first.isTemplate)
     }
 
@@ -80,7 +46,7 @@ struct ProviderIconResourcesTests {
 
         let image = try #require(ProviderBrandIcon.image(for: .ollama))
 
-        #expect(image.size == NSSize(width: 16, height: 16))
+        #expect(image.size == NSSize(width: 18, height: 18))
         #expect(image.isTemplate)
 
         let bitmap = try #require(NSBitmapImageRep(

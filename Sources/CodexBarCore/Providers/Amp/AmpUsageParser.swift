@@ -29,6 +29,12 @@ enum AmpUsageParser {
         let freePattern = #"(?im)^\s*Amp Free:\s*\$?"# + amountPattern +
             #"\s*/\s*\$?"# + amountPattern +
             #"\s+remaining(?:\s*\(replenishes\s*\+\$?"# + amountPattern + #"\s*/\s*hour\))?"#
+        let freePercentPattern = #"(?im)^\s*Amp Free:\s*"# + amountPattern +
+            #"\s*%\s+remaining(?:\s+today)?(?:\s*(\(resets\s+daily\)))?"#
+        let subscriptionPattern = #"(?im)^\s*Subscription\s+(.+?):\s*"# + amountPattern +
+            #"\s*%\s+other\s+usage\s+and\s+"# + amountPattern +
+            #"\s*%\s+orb\s+usage\s+remaining\s*-\s*resets\s+upon\s+renewal\s+in\s+"# +
+            #"([0-9][0-9,]*)\s+(days?|months?)(?:\s+-\s+https?://\S+)?\s*$"#
         let creditsPattern = #"(?im)^\s*Individual credits:\s*\$?"# + amountPattern + #"\s+remaining"#
         let individualCredits = self.captures(in: text, pattern: creditsPattern)?.first
             .flatMap(self.number(from:))
@@ -55,22 +61,69 @@ enum AmpUsageParser {
                 quota: quota,
                 used: max(0, quota - remaining),
                 hourlyReplenishment: hourlyReplenishment,
-                windowHours: windowHours)
+                windowHours: windowHours,
+                resetDescription: nil)
         }()
-        guard freeUsage != nil || individualCredits != nil || !workspaceBalances.isEmpty else {
+        let freePercentUsage: FreeTierUsage? = {
+            guard let free = self.captures(in: text, pattern: freePercentPattern),
+                  let remaining = self.number(from: free[0])
+            else { return nil }
+            let clampedRemaining = min(100, max(0, remaining))
+            return FreeTierUsage(
+                quota: 100,
+                used: 100 - clampedRemaining,
+                hourlyReplenishment: 0,
+                windowHours: 24,
+                resetDescription: self.nonEmpty(free[1]).map { _ in "resets daily" })
+        }()
+        let resolvedFreeUsage = freeUsage ?? freePercentUsage
+        let subscriptionUsage: AmpSubscriptionUsage? = {
+            guard let subscription = self.captures(in: text, pattern: subscriptionPattern),
+                  subscription.count == 5,
+                  let plan = self.nonEmpty(subscription[0]),
+                  let otherRemaining = self.number(from: subscription[1]),
+                  let orbRemaining = self.number(from: subscription[2]),
+                  let renewalValue = Int(subscription[3].replacingOccurrences(of: ",", with: "")),
+                  let resetsAt = self.subscriptionResetDate(
+                      value: renewalValue,
+                      unit: subscription[4],
+                      now: now)
+            else { return nil }
+            let unit = subscription[4].lowercased()
+            let singularUnit = unit.hasPrefix("month") ? "month" : "day"
+            let resetDescription = "renews in \(renewalValue) \(singularUnit)\(renewalValue == 1 ? "" : "s")"
+            return AmpSubscriptionUsage(
+                plan: plan,
+                otherUsedPercent: 100 - min(100, max(0, otherRemaining)),
+                orbUsedPercent: 100 - min(100, max(0, orbRemaining)),
+                resetsAt: resetsAt,
+                resetDescription: resetDescription)
+        }()
+        guard resolvedFreeUsage != nil || subscriptionUsage != nil || individualCredits != nil ||
+            !workspaceBalances.isEmpty
+        else {
             throw AmpUsageError.parseFailed("Missing Amp usage data.")
         }
 
         return AmpUsageSnapshot(
-            freeQuota: freeUsage?.quota,
-            freeUsed: freeUsage?.used,
-            hourlyReplenishment: freeUsage?.hourlyReplenishment,
-            windowHours: freeUsage?.windowHours,
+            freeQuota: resolvedFreeUsage?.quota,
+            freeUsed: resolvedFreeUsage?.used,
+            hourlyReplenishment: resolvedFreeUsage?.hourlyReplenishment,
+            windowHours: resolvedFreeUsage?.windowHours,
             individualCredits: individualCredits,
             workspaceBalances: workspaceBalances,
             accountEmail: self.nonEmpty(identity?[0]),
             accountOrganization: self.nonEmpty(identity?[1]),
-            updatedAt: now)
+            updatedAt: now,
+            freeResetDescription: resolvedFreeUsage?.resetDescription,
+            subscription: subscriptionUsage)
+    }
+
+    private static func subscriptionResetDate(value: Int, unit: String, now: Date) -> Date? {
+        if unit.lowercased().hasPrefix("month") {
+            return Calendar(identifier: .gregorian).date(byAdding: .month, value: value, to: now)
+        }
+        return now.addingTimeInterval(TimeInterval(value) * 24 * 60 * 60)
     }
 
     private struct FreeTierUsage {
@@ -78,6 +131,7 @@ enum AmpUsageParser {
         let used: Double
         let hourlyReplenishment: Double
         let windowHours: Double?
+        let resetDescription: String?
     }
 
     private static func parseFreeTierUsage(_ html: String) -> FreeTierUsage? {
@@ -103,7 +157,8 @@ enum AmpUsageParser {
             quota: quota,
             used: used,
             hourlyReplenishment: hourly,
-            windowHours: windowHours)
+            windowHours: windowHours,
+            resetDescription: nil)
     }
 
     private static func extractObject(named token: String, in text: String) -> String? {

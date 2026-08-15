@@ -18,18 +18,24 @@ private final class PiSessionISO8601FormatterBox: @unchecked Sendable {
 enum PiSessionCostScanner {
     struct Options {
         var piSessionsRoot: URL?
+        var ompSessionsRoot: URL?
         var cacheRoot: URL?
+        var calendar: Calendar
         var refreshMinIntervalSeconds: TimeInterval = 60
         var forceRescan: Bool = false
 
         init(
             piSessionsRoot: URL? = nil,
+            ompSessionsRoot: URL? = nil,
             cacheRoot: URL? = nil,
+            calendar: Calendar = .current,
             refreshMinIntervalSeconds: TimeInterval = 60,
             forceRescan: Bool = false)
         {
             self.piSessionsRoot = piSessionsRoot
+            self.ompSessionsRoot = ompSessionsRoot
             self.cacheRoot = cacheRoot
+            self.calendar = calendar
             self.refreshMinIntervalSeconds = refreshMinIntervalSeconds
             self.forceRescan = forceRescan
         }
@@ -37,8 +43,16 @@ enum PiSessionCostScanner {
 
     private struct ParseResult {
         let contributions: [String: [String: [String: PiPackedUsage]]]
+        let unkeyedContributions: [String: [String: [String: PiPackedUsage]]]
+        let entryUsages: [String: PiSessionEntryUsage]
         let parsedBytes: Int64
+        let sessionID: String?
         let lastModelContext: PiModelContext?
+    }
+
+    private struct SessionFileCandidate {
+        let url: URL
+        let rootIndex: Int
     }
 
     private struct AssistantIdentity {
@@ -93,12 +107,19 @@ enum PiSessionCostScanner {
         options: Options = Options(),
         checkCancellation: CostUsageScanner.CancellationCheck?) throws -> CostUsageDailyReport
     {
+        // Provider-specific by design: Pi records only OpenAI Codex and Anthropic sessions with distinct pricing.
         guard provider == .codex || provider == .claude else {
             return CostUsageDailyReport(data: [], summary: nil)
         }
 
-        let range = CostUsageScanner.CostUsageDayRange(since: since, until: until)
+        let range = CostUsageScanner.CostUsageDayRange(
+            since: since,
+            until: until,
+            calendar: options.calendar)
         var cache = PiSessionCostCacheIO.load(cacheRoot: options.cacheRoot)
+        if cache.timeZoneIdentifier != range.calendar.timeZone.identifier {
+            cache = PiSessionCostCache()
+        }
         let nowMs = Int64(now.timeIntervalSince1970 * 1000)
         let refreshMs = Int64(max(0, options.refreshMinIntervalSeconds) * 1000)
         let pricingContext = self.pricingContext(now: now, cacheRoot: options.cacheRoot)
@@ -113,14 +134,28 @@ enum PiSessionCostScanner {
 
         if shouldRefresh {
             try checkCancellation?()
-            let root = self.defaultPiSessionsRoot(options: options)
-            let startCutoff = self.dateFromDayKey(range.scanSinceKey) ?? since
-            let files = self.listPiSessionFiles(root: root, startCutoffLocal: startCutoff)
-            let filePathsInScan = Set(files.map(\.path))
+            let roots = self.defaultSessionRoots(options: options)
+            let startCutoff = self.dateFromDayKey(range.scanSinceKey, calendar: range.calendar) ?? since
+            var files: [SessionFileCandidate] = []
+            for (rootIndex, root) in roots.enumerated() {
+                for url in self.listPiSessionFiles(
+                    root: root,
+                    startCutoffLocal: startCutoff,
+                    calendar: range.calendar)
+                {
+                    files.append(SessionFileCandidate(url: url, rootIndex: rootIndex))
+                }
+            }
+            files.sort { lhs, rhs in
+                lhs.rootIndex == rhs.rootIndex
+                    ? lhs.url.path < rhs.url.path
+                    : lhs.rootIndex < rhs.rootIndex
+            }
+            let filePathsInScan = Set(files.map(\.url.path))
 
-            for fileURL in files {
+            for file in files {
                 try self.scanPiSessionFile(
-                    fileURL: fileURL,
+                    fileURL: file.url,
                     cache: &cache,
                     context: ScanContext(
                         range: range,
@@ -140,12 +175,17 @@ enum PiSessionCostScanner {
                 cache.files.removeValue(forKey: key)
             }
 
+            try self.rebuildDailyUsage(cache: &cache, files: files, checkCancellation: checkCancellation)
+
             cache.scanSinceKey = range.scanSinceKey
             cache.scanUntilKey = range.scanUntilKey
             cache.pricingKey = pricingContext.pricingKey
             cache.lastScanUnixMs = nowMs
             try checkCancellation?()
-            PiSessionCostCacheIO.save(cache: cache, cacheRoot: options.cacheRoot)
+            PiSessionCostCacheIO.save(
+                cache: cache,
+                cacheRoot: options.cacheRoot,
+                calendar: range.calendar)
         }
 
         return self.buildReport(
@@ -165,14 +205,16 @@ enum PiSessionCostScanner {
         since: Date,
         until: Date,
         now: Date = Date(),
-        cacheRoot: URL? = nil) -> CostUsageDailyReport?
+        cacheRoot: URL? = nil,
+        calendar: Calendar = .current) -> CostUsageDailyReport?
     {
         self.loadCachedDailyReportResult(
             provider: provider,
             since: since,
             until: until,
             now: now,
-            cacheRoot: cacheRoot)?.report
+            cacheRoot: cacheRoot,
+            calendar: calendar)?.report
     }
 
     static func loadCachedDailyReportResult(
@@ -180,12 +222,14 @@ enum PiSessionCostScanner {
         since: Date,
         until: Date,
         now: Date = Date(),
-        cacheRoot: URL? = nil) -> CachedDailyReportResult?
+        cacheRoot: URL? = nil,
+        calendar: Calendar = .current) -> CachedDailyReportResult?
     {
         guard provider == .codex || provider == .claude else { return nil }
 
-        let range = CostUsageScanner.CostUsageDayRange(since: since, until: until)
+        let range = CostUsageScanner.CostUsageDayRange(since: since, until: until, calendar: calendar)
         let cache = PiSessionCostCacheIO.load(cacheRoot: cacheRoot)
+        guard cache.timeZoneIdentifier == range.calendar.timeZone.identifier else { return nil }
         guard !cache.daysByProvider.isEmpty else { return nil }
         guard !self.requestedWindowExpandsCache(range: range, cache: cache) else { return nil }
 
@@ -234,15 +278,25 @@ enum PiSessionCostScanner {
         return false
     }
 
-    private static func defaultPiSessionsRoot(options: Options) -> URL {
-        if let override = options.piSessionsRoot { return override }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".pi", isDirectory: true)
-            .appendingPathComponent("agent", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
+    private static func defaultSessionRoots(options: Options) -> [URL] {
+        if options.piSessionsRoot != nil || options.ompSessionsRoot != nil {
+            return [options.piSessionsRoot, options.ompSessionsRoot].compactMap(\.self)
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return [".pi", ".omp"].map { directory in
+            home
+                .appendingPathComponent(directory, isDirectory: true)
+                .appendingPathComponent("agent", isDirectory: true)
+                .appendingPathComponent("sessions", isDirectory: true)
+        }
     }
 
-    private static func listPiSessionFiles(root: URL, startCutoffLocal: Date) -> [URL] {
+    private static func listPiSessionFiles(
+        root: URL,
+        startCutoffLocal: Date,
+        calendar: Calendar) -> [URL]
+    {
         guard FileManager.default.fileExists(atPath: root.path) else { return [] }
 
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
@@ -263,7 +317,11 @@ enum PiSessionCostScanner {
             let startedAt = self.parseSessionStartFromFilename(item.lastPathComponent)
             let modifiedAt = values?.contentModificationDate
             if self
-                .shouldIncludeFile(startedAt: startedAt, modifiedAt: modifiedAt, startCutoffLocal: startCutoffLocal)
+                .shouldIncludeFile(
+                    startedAt: startedAt,
+                    modifiedAt: modifiedAt,
+                    startCutoffLocal: startCutoffLocal,
+                    calendar: calendar)
             {
                 output.append(item)
             }
@@ -275,12 +333,13 @@ enum PiSessionCostScanner {
     private static func shouldIncludeFile(
         startedAt: Date?,
         modifiedAt: Date?,
-        startCutoffLocal: Date) -> Bool
+        startCutoffLocal: Date,
+        calendar: Calendar) -> Bool
     {
-        if let modifiedAt, self.localMidnight(modifiedAt) >= startCutoffLocal {
+        if let modifiedAt, self.localMidnight(modifiedAt, calendar: calendar) >= startCutoffLocal {
             return true
         }
-        if let startedAt, self.localMidnight(startedAt) >= startCutoffLocal {
+        if let startedAt, self.localMidnight(startedAt, calendar: calendar) >= startCutoffLocal {
             return true
         }
         return false
@@ -322,6 +381,7 @@ enum PiSessionCostScanner {
                 fileURL: fileURL,
                 range: context.range,
                 startOffset: cached.parsedBytes,
+                initialSessionID: cached.sessionID,
                 initialModelContext: cached.lastModelContext,
                 pricingContext: context.pricingContext,
                 checkCancellation: context.checkCancellation)
@@ -332,12 +392,19 @@ enum PiSessionCostScanner {
                     sign: 1)
             }
             let merged = self.mergedContributions(existing: cached.contributions, delta: delta.contributions)
+            let mergedUnkeyed = self.mergedContributions(
+                existing: cached.unkeyedContributions,
+                delta: delta.unkeyedContributions)
+            let mergedEntryUsages = cached.entryUsages.merging(delta.entryUsages) { _, appended in appended }
             storeFileUsage(PiSessionFileUsage(
                 mtimeUnixMs: mtimeMs,
                 size: size,
                 parsedBytes: delta.parsedBytes,
+                sessionID: delta.sessionID ?? cached.sessionID,
                 lastModelContext: delta.lastModelContext,
-                contributions: merged))
+                contributions: merged,
+                unkeyedContributions: mergedUnkeyed,
+                entryUsages: mergedEntryUsages))
             return
         }
 
@@ -361,22 +428,35 @@ enum PiSessionCostScanner {
             mtimeUnixMs: mtimeMs,
             size: size,
             parsedBytes: parsed.parsedBytes,
+            sessionID: parsed.sessionID,
             lastModelContext: parsed.lastModelContext,
-            contributions: parsed.contributions))
+            contributions: parsed.contributions,
+            unkeyedContributions: parsed.unkeyedContributions,
+            entryUsages: parsed.entryUsages))
     }
 
     private static func parsePiSessionFile(
         fileURL: URL,
         range: CostUsageScanner.CostUsageDayRange,
         startOffset: Int64 = 0,
+        initialSessionID: String? = nil,
         initialModelContext: PiModelContext? = nil,
         pricingContext: ModelsDevPricingContext? = nil,
         checkCancellation: CostUsageScanner.CancellationCheck? = nil) throws -> ParseResult
     {
+        var sessionID = initialSessionID
         var currentModelContext = initialModelContext
         var contributions: [String: [String: [String: PiPackedUsage]]] = [:]
+        var unkeyedContributions: [String: [String: [String: PiPackedUsage]]] = [:]
+        var entryUsages: [String: PiSessionEntryUsage] = [:]
 
-        func add(provider: UsageProvider, dayKey: String, modelName: String, usage: PiPackedUsage) {
+        func add(
+            provider: UsageProvider,
+            dayKey: String,
+            modelName: String,
+            usage: PiPackedUsage,
+            entryID: String?)
+        {
             guard !usage.isZero else { return }
             guard CostUsageScanner.CostUsageDayRange.isInRange(
                 dayKey: dayKey,
@@ -405,6 +485,23 @@ enum PiSessionCostScanner {
             } else {
                 contributions[providerKey] = providerDays
             }
+
+            if let entryID {
+                entryUsages[entryID] = PiSessionEntryUsage(
+                    providerRawValue: providerKey,
+                    dayKey: dayKey,
+                    modelName: modelName,
+                    usage: usage)
+            } else {
+                var providerDays = unkeyedContributions[providerKey] ?? [:]
+                var dayModels = providerDays[dayKey] ?? [:]
+                dayModels[modelName] = self.addPacked(
+                    a: dayModels[modelName] ?? PiPackedUsage(),
+                    b: usage,
+                    sign: 1)
+                providerDays[dayKey] = dayModels
+                unkeyedContributions[providerKey] = providerDays
+            }
         }
 
         let parsedBytes: Int64
@@ -422,6 +519,11 @@ enum PiSessionCostScanner {
                         else { return }
                         guard let type = object["type"] as? String else { return }
 
+                        if type == "session" {
+                            sessionID = sessionID ?? self.sessionIdentifier(from: object)
+                            return
+                        }
+
                         if type == "model_change" {
                             currentModelContext = self.modelContext(from: object)
                             return
@@ -436,14 +538,21 @@ enum PiSessionCostScanner {
                             fallback: currentModelContext)
                         guard let identity else { return }
                         guard let date = self.timestampDate(entry: object, message: message) else { return }
-                        let dayKey = CostUsageScanner.CostUsageDayRange.dayKey(from: date)
+                        let dayKey = CostUsageScanner.CostUsageDayRange.dayKey(
+                            from: date,
+                            calendar: range.calendar)
                         let usage = self.extractUsage(
                             provider: identity.provider,
                             modelName: identity.modelName,
                             message: message,
                             pricingDate: date,
                             pricingContext: pricingContext)
-                        add(provider: identity.provider, dayKey: dayKey, modelName: identity.modelName, usage: usage)
+                        add(
+                            provider: identity.provider,
+                            dayKey: dayKey,
+                            modelName: identity.modelName,
+                            usage: usage,
+                            entryID: self.entryIdentifier(from: object))
                     }
                 })
         } catch is CancellationError {
@@ -454,8 +563,71 @@ enum PiSessionCostScanner {
 
         return ParseResult(
             contributions: contributions,
+            unkeyedContributions: unkeyedContributions,
+            entryUsages: entryUsages,
             parsedBytes: parsedBytes,
+            sessionID: sessionID,
             lastModelContext: currentModelContext)
+    }
+
+    private static func sessionIdentifier(from object: [String: Any]) -> String? {
+        let candidate = ["id", "sessionId", "session_id"]
+            .compactMap { object[$0] as? String }
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !candidate.isEmpty, candidate.utf8.count <= 1024 else { return nil }
+        return candidate
+    }
+
+    private static func entryIdentifier(from object: [String: Any]) -> String? {
+        let candidate = (object["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !candidate.isEmpty, candidate.utf8.count <= 1024 else { return nil }
+        return candidate
+    }
+
+    private static func rebuildDailyUsage(
+        cache: inout PiSessionCostCache,
+        files: [SessionFileCandidate],
+        checkCancellation: CostUsageScanner.CancellationCheck?) throws
+    {
+        var seenEntriesBySessionID: [String: Set<String>] = [:]
+        cache.daysByProvider = [:]
+
+        for file in files {
+            try checkCancellation?()
+            guard let usage = cache.files[file.url.path] else { continue }
+            guard let sessionID = usage.sessionID else {
+                self.applyContributions(
+                    daysByProvider: &cache.daysByProvider,
+                    contributions: usage.contributions,
+                    sign: 1)
+                continue
+            }
+
+            self.applyContributions(
+                daysByProvider: &cache.daysByProvider,
+                contributions: usage.unkeyedContributions,
+                sign: 1)
+
+            var seenEntries = seenEntriesBySessionID[sessionID] ?? []
+            for entryID in usage.entryUsages.keys.sorted() where seenEntries.insert(entryID).inserted {
+                guard let entryUsage = usage.entryUsages[entryID] else { continue }
+                self.applyEntryUsage(daysByProvider: &cache.daysByProvider, entryUsage: entryUsage)
+            }
+            seenEntriesBySessionID[sessionID] = seenEntries
+        }
+    }
+
+    private static func applyEntryUsage(
+        daysByProvider: inout [String: [String: [String: PiPackedUsage]]],
+        entryUsage: PiSessionEntryUsage)
+    {
+        let contributions = [
+            entryUsage.providerRawValue: [
+                entryUsage.dayKey: [entryUsage.modelName: entryUsage.usage],
+            ],
+        ]
+        self.applyContributions(daysByProvider: &daysByProvider, contributions: contributions, sign: 1)
     }
 
     private static func modelContext(from object: [String: Any]) -> PiModelContext? {
@@ -540,6 +712,7 @@ enum PiSessionCostScanner {
     private static func normalizeModelName(_ raw: String, provider: UsageProvider) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        // Provider-specific by design: Pi model IDs require the vendor-specific Codex/Claude pricing normalizers.
         return switch provider {
         case .codex:
             CostUsagePricing.normalizeCodexModel(trimmed)
@@ -630,7 +803,7 @@ enum PiSessionCostScanner {
             cacheWriteTokens: cacheWrite,
             outputTokens: output,
             totalTokens: totalTokens)
-        // Pi JSONL does not record Anthropic cache retention, so use Pi's persisted default tariff.
+        // Pi-compatible JSONL does not record Anthropic cache retention, so use Pi's persisted default tariff.
         let costUSD = self.computedCostUSD(
             provider: provider,
             modelName: modelName,
@@ -899,21 +1072,23 @@ extension PiSessionCostScanner {
             ?? self.isoFormatterBox.plain.date(from: text)
     }
 
-    private static func localMidnight(_ date: Date) -> Date {
-        let components = Calendar.current.dateComponents([.year, .month, .day], from: date)
-        return Calendar.current.date(from: components) ?? date
+    private static func localMidnight(_ date: Date, calendar: Calendar) -> Date {
+        let calendar = CostUsageScanner.CostUsageDayRange.localGregorianCalendar(matching: calendar)
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return calendar.date(from: components) ?? date
     }
 
-    private static func dateFromDayKey(_ key: String) -> Date? {
+    private static func dateFromDayKey(_ key: String, calendar: Calendar) -> Date? {
         let parts = key.split(separator: "-")
         guard parts.count == 3,
               let year = Int(parts[0]),
               let month = Int(parts[1]),
               let day = Int(parts[2]) else { return nil }
 
+        let calendar = CostUsageScanner.CostUsageDayRange.localGregorianCalendar(matching: calendar)
         var components = DateComponents()
-        components.calendar = Calendar.current
-        components.timeZone = TimeZone.current
+        components.calendar = calendar
+        components.timeZone = calendar.timeZone
         components.year = year
         components.month = month
         components.day = day

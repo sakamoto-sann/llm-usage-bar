@@ -3,6 +3,29 @@ import Commander
 import Foundation
 
 extension CodexBarCLI {
+    static func runConfig(path: [String], values: ParsedValues) {
+        switch path {
+        case ["config", "validate"]:
+            self.runConfigValidate(values)
+        case ["config", "dump"]:
+            self.runConfigDump(values)
+        case ["config", "providers"]:
+            self.runConfigProviders(values)
+        case ["config", "enable"]:
+            self.runConfigSetProviderEnabled(values, enabled: true)
+        case ["config", "disable"]:
+            self.runConfigSetProviderEnabled(values, enabled: false)
+        case ["config", "set-api-key"]:
+            self.runConfigSetAPIKey(values)
+        default:
+            self.exit(
+                code: .failure,
+                message: "Unknown command",
+                output: CLIOutputPreferences.from(values: values),
+                kind: .args)
+        }
+    }
+
     static func runConfigValidate(_ values: ParsedValues) {
         let output = CLIOutputPreferences.from(values: values)
         let config = Self.loadConfig(output: output)
@@ -31,7 +54,8 @@ extension CodexBarCLI {
 
     static func runConfigDump(_ values: ParsedValues) {
         let output = CLIOutputPreferences.from(values: values)
-        let config = Self.loadConfig(output: output)
+        let showSecrets = values.flags.contains("showSecrets")
+        let config = Self.loadConfig(output: output).sanitizedForDump(showSecrets: showSecrets)
         Self.printJSON(config, pretty: output.pretty)
         Self.exit(code: .success, output: output, kind: .config)
     }
@@ -95,6 +119,15 @@ extension CodexBarCLI {
         Self.exit(code: .success, output: output, kind: .config)
     }
 
+    static func unsupportedAPIKeyErrorMessage(for provider: UsageProvider, rawProvider: String) -> String {
+        // Provider-specific by design: Codex users are redirected to the separate OpenAI Platform provider ID.
+        if provider == .codex {
+            "\(rawProvider) does not support config API keys. For OpenAI Platform API keys, use '--provider openai'."
+        } else {
+            "\(rawProvider) does not support config API keys."
+        }
+    }
+
     static func runConfigSetAPIKey(_ values: ParsedValues) {
         let output = CLIOutputPreferences.from(values: values)
 
@@ -110,7 +143,7 @@ extension CodexBarCLI {
         guard ProviderConfigEnvironment.supportsAPIKeyOverride(for: provider) else {
             Self.exit(
                 code: .failure,
-                message: "\(rawProvider) does not support config API keys.",
+                message: Self.unsupportedAPIKeyErrorMessage(for: provider, rawProvider: rawProvider),
                 output: output,
                 kind: .args)
         }
@@ -153,7 +186,7 @@ extension CodexBarCLI {
 
         let result = ConfigSetAPIKeyResult(
             provider: provider.rawValue,
-            enabled: config.providerConfig(for: provider)?.enabled ?? false,
+            enabled: config.providerConfig(for: provider.instanceID)?.enabled ?? false,
             configPath: store.fileURL.path)
 
         switch output.format {
@@ -194,7 +227,7 @@ extension CodexBarCLI {
         accountOptions: ConfigAPIKeyAccountOptions? = nil) -> CodexBarConfig
     {
         var updated = config.normalized()
-        var providerConfig = updated.providerConfig(for: provider) ?? ProviderConfig(id: provider)
+        var providerConfig = updated.providerConfig(for: provider.instanceID) ?? ProviderConfig(id: provider.instanceID)
         if let accountOptions {
             let existing = providerConfig.tokenAccounts
             let accounts = existing?.accounts ?? []
@@ -219,6 +252,10 @@ extension CodexBarCLI {
             return updated
         }
         providerConfig.apiKey = apiKey
+        // Provider-specific by design: legacy Moonshot config binds a newly set key to its existing/default region.
+        if provider == .moonshot {
+            providerConfig.apiKeyRegion = providerConfig.sanitizedRegion ?? MoonshotRegion.international.rawValue
+        }
         if enableProvider {
             providerConfig.enabled = true
         }
@@ -247,6 +284,7 @@ extension CodexBarCLI {
             cleanedWorkspaceID != nil
         guard hasAccountOptions else { return nil }
 
+        // Provider-specific by design: z.ai team tokens alone accept organization, workspace, and usage-scope fields.
         guard provider == .zai else {
             throw CLIArgumentError("Token-account options are only supported for --provider zai.")
         }
@@ -274,7 +312,7 @@ extension CodexBarCLI {
         enabled: Bool) -> CodexBarConfig
     {
         var updated = config.normalized()
-        var providerConfig = updated.providerConfig(for: provider) ?? ProviderConfig(id: provider)
+        var providerConfig = updated.providerConfig(for: provider.instanceID) ?? ProviderConfig(id: provider.instanceID)
         providerConfig.enabled = enabled
         updated.setProviderConfig(providerConfig)
         return updated
@@ -283,7 +321,8 @@ extension CodexBarCLI {
     static func configProviderStatuses(_ config: CodexBarConfig) -> [ConfigProviderStatusResult] {
         let metadata = ProviderDescriptorRegistry.metadata
         return config.normalized().providers.map { providerConfig in
-            let meta = metadata[providerConfig.id]
+            let provider = providerConfig.id.firstPartyProvider
+            let meta = provider.flatMap { metadata[$0] }
             let defaultEnabled = meta?.defaultEnabled ?? false
             return ConfigProviderStatusResult(
                 provider: providerConfig.id.rawValue,
@@ -348,6 +387,32 @@ struct ConfigOptions: CommanderParsable {
 
     @Flag(name: .long("pretty"), help: "Pretty-print JSON output")
     var pretty: Bool = false
+}
+
+struct ConfigDumpOptions: CommanderParsable {
+    @Flag(names: [.short("v"), .long("verbose")], help: "Enable verbose logging")
+    var verbose: Bool = false
+
+    @Flag(name: .long("json-output"), help: "Emit machine-readable logs")
+    var jsonOutput: Bool = false
+
+    @Option(name: .long("log-level"), help: "Set log level (trace|verbose|debug|info|warning|error|critical)")
+    var logLevel: String?
+
+    @Option(name: .long("format"), help: "Output format: text | json")
+    var format: OutputFormat?
+
+    @Flag(name: .long("json"), help: "")
+    var jsonShortcut: Bool = false
+
+    @Flag(name: .long("json-only"), help: "Emit JSON only (suppress non-JSON output)")
+    var jsonOnly: Bool = false
+
+    @Flag(name: .long("pretty"), help: "Pretty-print JSON output")
+    var pretty: Bool = false
+
+    @Flag(name: .long("show-secrets"), help: "Include raw un-redacted API keys and tokens in output")
+    var showSecrets: Bool = false
 }
 
 struct ConfigSetAPIKeyOptions: CommanderParsable {

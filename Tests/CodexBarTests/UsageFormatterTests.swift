@@ -300,6 +300,13 @@ struct UsageFormatterTests {
         #expect(UsageFormatter.modelDisplayName("Claude Opus 4.5 2025 1101") == "Claude Opus 4.5")
         #expect(UsageFormatter.modelDisplayName("claude-sonnet-4-5") == "claude-sonnet-4-5")
         #expect(UsageFormatter.modelDisplayName("gpt-5.3-codex-spark") == "gpt-5.3-codex-spark")
+        #expect(UsageFormatter.modelDisplayName("unknown") == "Unknown model")
+    }
+
+    @Test
+    func `model display name labels codex auto review role`() {
+        #expect(UsageFormatter.modelDisplayName("codex-auto-review") == "Codex Auto Review")
+        #expect(UsageFormatter.modelDisplayName("gpt-5.6-sol") == "gpt-5.6-sol")
     }
 
     @Test
@@ -466,6 +473,75 @@ struct UsageFormatterTests {
         #expect(UsageFormatter.byteCountStringLong(1024 * 1024) == "1 [byte_unit_megabyte]")
         #expect(UsageFormatter.byteCountStringLong(1024 * 1024 + 1) == "1.0 [byte_unit_megabyte]")
         #expect(UsageFormatter.byteCountStringLong(.min) == "-8589934592 [byte_unit_gigabytes]")
+    }
+
+    @Test
+    func `currency exchange converts rates and formats correctly`() {
+        let exchange = CurrencyExchange.shared
+        let epsilon = 1e-9
+        // USD → USD is identity
+        #expect(abs((exchange.convert(usdAmount: 10.0, to: "USD") ?? 0) - 10.0) < epsilon)
+
+        // Cross-currency conversion via USD pivot
+        let gbpRate = exchange.rate(for: "GBP") ?? 0.79
+        let eurRate = exchange.rate(for: "EUR") ?? 0.92
+        #expect(abs((exchange.convert(usdAmount: 10.0, to: "GBP") ?? 0) - 10.0 * gbpRate) < epsilon)
+        #expect(abs((exchange.convert(usdAmount: 10.0, to: "EUR") ?? 0) - 10.0 * eurRate) < epsilon)
+
+        // Cross-currency: GBP → EUR
+        let gbpToEur = exchange.convert(amount: 10.0, from: "GBP", to: "EUR")
+        let expectedGbpToEur = 10.0 / gbpRate * eurRate
+        #expect(abs((gbpToEur ?? 0) - expectedGbpToEur) < epsilon)
+
+        // GBP → USD cross-currency
+        let gbpToUsd = exchange.convert(amount: 10.0, from: "GBP", to: "USD")
+        #expect(abs((gbpToUsd ?? 0) - 10.0 / gbpRate) < epsilon)
+
+        // Formatting
+        let gbpFormatted = UsageFormatter.convertedCostString(10.0, targetCurrency: "GBP")
+        #expect(gbpFormatted.contains("£"))
+
+        let usdFormatted = UsageFormatter.convertedCostString(10.0, targetCurrency: "USD")
+        #expect(usdFormatted == "$10.00")
+
+        // Smart conversion with preferred currency
+        let autoResult = UsageFormatter.convertedCostString(10.0, preferredCurrency: "auto", providerCurrency: "GBP")
+        #expect(autoResult.contains("£"))
+
+        let explicitCNY = UsageFormatter.convertedCostString(10.0, preferredCurrency: "CNY", providerCurrency: "USD")
+        #expect(explicitCNY.contains("¥"))
+
+        let krwRate = exchange.rate(for: "KRW") ?? 1428.90
+        #expect(abs((exchange.convert(usdAmount: 10.0, to: "KRW") ?? 0) - 10.0 * krwRate) < epsilon)
+        let explicitKRW = UsageFormatter.convertedCostString(10.0, preferredCurrency: "KRW", providerCurrency: "USD")
+        #expect(explicitKRW.contains("₩"))
+        #expect(!explicitKRW.contains("."))
+
+        let czkRate = exchange.rate(for: "CZK") ?? 21.0
+        #expect(abs((exchange.convert(usdAmount: 10.0, to: "CZK") ?? 0) - 10.0 * czkRate) < epsilon)
+        let explicitCZK = UsageFormatter.convertedCostString(10.0, preferredCurrency: "CZK", providerCurrency: "USD")
+        #expect(explicitCZK.contains("CZK"))
+        #expect(explicitCZK.contains("."))
+
+        #expect(exchange.convert(amount: 10.0, from: "CHF", to: "USD") == nil)
+        let unavailable = UsageFormatter.convertedCostString(
+            10.0,
+            preferredCurrency: "USD",
+            providerCurrency: "CHF")
+        #expect(unavailable.contains("CHF"))
+        #expect(!unavailable.contains("$"))
+    }
+
+    @Test
+    func `live exchange rates require an explicit non USD currency`() {
+        #expect(!CurrencyExchange.requiresLiveRates(preferredCurrencyCode: "USD"))
+        #expect(!CurrencyExchange.requiresLiveRates(preferredCurrencyCode: " usd "))
+        #expect(!CurrencyExchange.requiresLiveRates(preferredCurrencyCode: "auto"))
+        #expect(!CurrencyExchange.requiresLiveRates(preferredCurrencyCode: "CHF"))
+        #expect(CurrencyExchange.requiresLiveRates(preferredCurrencyCode: "GBP"))
+        #expect(CurrencyExchange.requiresLiveRates(preferredCurrencyCode: " eur "))
+        #expect(CurrencyExchange.requiresLiveRates(preferredCurrencyCode: "KRW"))
+        #expect(CurrencyExchange.requiresLiveRates(preferredCurrencyCode: "CZK"))
     }
 
     @Test

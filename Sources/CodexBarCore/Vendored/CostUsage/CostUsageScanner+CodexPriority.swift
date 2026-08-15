@@ -14,8 +14,8 @@ extension CostUsageScanner {
     private static let requestMarker = "websocket request:"
 
     static func defaultCodexPriorityDatabaseURL() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex", isDirectory: true)
+        CodexHomeScope
+            .ambientHomeURL(env: [:])
             .appendingPathComponent("logs_2.sqlite", isDirectory: false)
     }
 
@@ -258,7 +258,8 @@ extension CostUsageScanner {
         from logs
         where ts >= ? and ts < ?
           and (feedback_log_body like '%websocket request:%'
-               or feedback_log_body like '%response.completed%')
+               or feedback_log_body like '%response.completed%'
+               or feedback_log_body like '%service_tier: Some(Some("priority"))%')
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else { return [:] }
@@ -404,7 +405,9 @@ extension CostUsageScanner {
             }
             while true {
                 let stepResult = sqlite3_step(stmt)
-                if stepResult == SQLITE_DONE { break }
+                if stepResult == SQLITE_DONE {
+                    break
+                }
                 guard stepResult == SQLITE_ROW else { return nil }
                 retained.insert(sqlite3_column_int64(stmt, 0))
             }
@@ -507,7 +510,8 @@ extension CostUsageScanner {
                 from logs indexed by idx_logs_ts
                 where ts >= ?
                   and (feedback_log_body like '%websocket request:%'
-                       or feedback_log_body like '%response.completed%')
+                       or feedback_log_body like '%response.completed%'
+                       or feedback_log_body like '%service_tier: Some(Some("priority"))%')
                 order by rowid
                 """,
                 true)
@@ -518,7 +522,8 @@ extension CostUsageScanner {
             from logs
             where rowid > ? and ts >= ?
               and (feedback_log_body like '%websocket request:%'
-                   or feedback_log_body like '%response.completed%')
+                   or feedback_log_body like '%response.completed%'
+                   or feedback_log_body like '%service_tier: Some(Some("priority"))%')
             order by rowid
             """,
             false)
@@ -539,7 +544,9 @@ extension CostUsageScanner {
     #endif
 
     static func parseCodexPriorityTraceRow(timestamp: String?, body: String) -> CodexPriorityTurnMetadata? {
-        guard let markerRange = body.range(of: self.requestMarker) else { return nil }
+        guard let markerRange = body.range(of: self.requestMarker) else {
+            return self.parseCodexPrioritySubmissionRow(timestamp: timestamp, body: body)
+        }
         let prefix = String(body[..<markerRange.lowerBound])
         let jsonText = body[markerRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = jsonText.data(using: .utf8),
@@ -557,6 +564,25 @@ extension CostUsageScanner {
             threadID: self.value(named: "thread_id", in: prefix),
             turnID: turnID,
             model: request["model"] as? String,
+            timestamp: timestamp)
+    }
+
+    private static func parseCodexPrioritySubmissionRow(
+        timestamp: String?,
+        body: String) -> CodexPriorityTurnMetadata?
+    {
+        guard body.contains(#"service_tier: Some(Some("priority"))"#),
+              let submissionRange = body.range(of: "Submission sub=Submission {")
+        else { return nil }
+        let submission = String(body[submissionRange.upperBound...])
+        guard let turnID = self.quotedValue(named: "id", in: submission) else { return nil }
+
+        return CodexPriorityTurnMetadata(
+            threadID: self.value(
+                named: "thread_id",
+                in: String(body[..<submissionRange.lowerBound])),
+            turnID: turnID,
+            model: nil,
             timestamp: timestamp)
     }
 
@@ -584,8 +610,16 @@ extension CostUsageScanner {
         guard let range = text.range(of: "\(name)=") else { return nil }
         let tail = text[range.upperBound...]
         let value = tail.prefix { char in
-            !char.isWhitespace && char != "," && char != "]" && char != ")"
+            !char.isWhitespace && char != "," && char != "]" && char != ")" && char != "}" && char != ":"
         }
+        return value.isEmpty ? nil : String(value)
+    }
+
+    private static func quotedValue(named name: String, in text: String) -> String? {
+        guard let range = text.range(of: "\(name): \"") else { return nil }
+        let tail = text[range.upperBound...]
+        guard let end = tail.firstIndex(of: "\"") else { return nil }
+        let value = tail[..<end]
         return value.isEmpty ? nil : String(value)
     }
 
@@ -609,8 +643,12 @@ extension CostUsageScanner {
     private static func timestamp(_ timestamp: String?, isInRangeSince since: String?, until: String?) -> Bool {
         guard since != nil || until != nil else { return true }
         guard let dayKey = self.dayKey(fromTimestamp: timestamp) else { return false }
-        if let since, dayKey < since { return false }
-        if let until, dayKey > until { return false }
+        if let since, dayKey < since {
+            return false
+        }
+        if let until, dayKey > until {
+            return false
+        }
         return true
     }
 
@@ -626,7 +664,8 @@ extension CostUsageScanner {
 
     private static func nextDayKey(after dayKey: String) -> String {
         guard let date = self.localDate(forDayKey: dayKey),
-              let next = Calendar.current.date(byAdding: .day, value: 1, to: date)
+              let next = CostUsageScanner.CostUsageDayRange.localGregorianCalendar()
+                  .date(byAdding: .day, value: 1, to: date)
         else { return dayKey }
         return CostUsageScanner.CostUsageDayRange.dayKey(from: next)
     }
@@ -644,7 +683,7 @@ extension CostUsageScanner {
               let day = Int(parts[2])
         else { return nil }
         var components = DateComponents()
-        components.calendar = Calendar.current
+        components.calendar = CostUsageScanner.CostUsageDayRange.localGregorianCalendar()
         components.year = year
         components.month = month
         components.day = day

@@ -56,7 +56,10 @@ struct ProviderRegistry {
                         runtime: .app,
                         sourceMode: sourceMode,
                         includeCredits: false,
-                        includeOptionalUsage: settings.showOptionalCreditsAndExtraUsage,
+                        includeOptionalUsage: ProviderTokenAccountSelection.shouldIncludeOptionalUsage(
+                            provider: provider,
+                            settings: settings,
+                            override: nil),
                         webTimeout: 60,
                         webDebugDumpHTML: false,
                         verbose: verbose,
@@ -76,6 +79,7 @@ struct ProviderRegistry {
                         },
                         providerManualTokenUpdater: { provider, token in
                             await MainActor.run {
+                                // Provider-specific by design: StepFun rotates its legacy app-owned session token.
                                 if provider == .stepfun {
                                     settings.stepfunToken = token
                                 }
@@ -101,7 +105,7 @@ struct ProviderRegistry {
     /// when specs are built, so `.adaptive` maps to the policy's nominal interval instead of a
     /// live decision; `.manual` stays nil.
     static func nominalRefreshInterval(for frequency: RefreshFrequency) -> TimeInterval? {
-        frequency == .adaptive ? AdaptiveRefreshPolicy.nominalIntervalForHeuristics : frequency.seconds
+        frequency.usesAdaptivePolicy ? AdaptiveRefreshPolicy.nominalIntervalForHeuristics : frequency.seconds
     }
 
     @MainActor
@@ -119,9 +123,14 @@ struct ProviderRegistry {
             tokenOverride: tokenOverride,
             codexActiveSourceOverride: codexActiveSourceOverride)
         for implementation in ProviderCatalog.all {
-            if let contribution = implementation.settingsSnapshot(context: context) {
-                builder.apply(contribution)
+            let registration = ProviderDescriptorRegistry.descriptor(for: implementation.id).settingsSection
+            guard let contribution = implementation.settingsSnapshot(context: context) else {
+                preconditionFailure("Missing settings snapshot section for provider '\(implementation.id.rawValue)'")
             }
+            guard registration.accepts(contribution) else {
+                preconditionFailure("Mismatched settings snapshot section for provider '\(implementation.id.rawValue)'")
+            }
+            builder.apply(contribution)
         }
         return builder.build()
     }
@@ -147,6 +156,7 @@ struct ProviderRegistry {
         // quotas, and dashboard data. Token-cost/session history is intentionally handled
         // separately because it is provider-level local telemetry from this Mac's Codex sessions,
         // not account-owned remote state.
+        // Provider-specific by design: managed Codex account selection scopes the fetcher's CODEX_HOME.
         if provider == .codex {
             let codexActiveSource = codexActiveSourceOverride ?? settings.codexResolvedActiveSource
             if let managedHomePath = settings.managedCodexRemoteHomePath(forActiveSource: codexActiveSource) {
@@ -161,6 +171,7 @@ struct ProviderRegistry {
     }
 
     static func makeFetcher(base: UsageFetcher, provider: UsageProvider, env: [String: String]) -> UsageFetcher {
+        // Provider-specific by design: a Codex account scope needs a fetcher rebuilt with its selected CODEX_HOME.
         guard provider == .codex else { return base }
         return UsageFetcher(environment: env)
     }

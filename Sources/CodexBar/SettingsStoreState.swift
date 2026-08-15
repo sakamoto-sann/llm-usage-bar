@@ -2,6 +2,7 @@ import Foundation
 
 struct SettingsDefaultsState {
     var refreshFrequency: RefreshFrequency
+    var adaptiveActivityScanConsent: AdaptiveActivityScanConsent
     var refreshAllProvidersOnMenuOpen: Bool
     var launchAtLogin: Bool
     var debugMenuEnabled: Bool
@@ -28,15 +29,22 @@ struct SettingsDefaultsState {
     var providerChangelogLinksEnabled: Bool
     var menuBarShowsBrandIconWithPercent: Bool
     var menuBarHidesCritters: Bool
+    var menuBarHighContrastOnInactiveDisplays: Bool
     var menuBarDisplayModeRaw: String?
     var menuBarShowsResetTimeWhenExhausted: Bool
     var kiroMenuBarDisplayModeRaw: String?
     var historicalTrackingEnabled: Bool
     var multiAccountMenuLayoutRaw: String
     var menuBarMetricPreferencesRaw: [String: String]
+    var storedMenuBarLayout: MenuBarLayout?
+    var menuBarLayoutOverridesRaw: [String: MenuBarLayout]
+    var menuBarLayoutSizeRaw: String
+    var menuBarLayoutGapRaw: String
+    var menuBarLayoutVerticalAdjustment: Int
     var copilotBudgetExtrasEnabled: Bool
     var copilotIconSecondaryWindowIDRaw: String
     var costUsageEnabled: Bool
+    var codexLocalSessionCostLedgerEnabled: Bool
     var costUsageHistoryDays: Int
     var costComparisonPeriodsEnabled: Bool
     var costSummaryDisplayStyleRaw: String
@@ -47,11 +55,14 @@ struct SettingsDefaultsState {
     var menuBarShowsHighestUsage: Bool
     var claudeOAuthKeychainPromptModeRaw: String?
     var claudeOAuthKeychainReadStrategyRaw: String?
+    var claudeOAuthDirectKeychainReadAllowed: Bool
     var claudeWebExtrasEnabledRaw: Bool
     var showOptionalCreditsAndExtraUsage: Bool
+    var claudeDailyRoutinesUsageVisible: Bool
     var codexSparkUsageVisible: Bool
     var openAIWebAccessEnabled: Bool
     var openAIWebBatterySaverEnabled: Bool
+    var backgroundWorkLowPowerModeEnabled: Bool
     var providerStorageFootprintsEnabled: Bool
     var jetbrainsIDEBasePath: String
     var mergeIcons: Bool
@@ -64,5 +75,12 @@ struct SettingsDefaultsState {
     var appLanguageRaw: String?
     var terminalAppRaw: String?
     var agentSessionsEnabled: Bool
+    var agentSessionLabelStyleRaw: String
     var agentSessionsManualHosts: String
+    var preferredCurrencyCode: String
+    var iCloudSyncEnabled: Bool
+    var iCloudSyncIncludeSecrets: Bool
+    var iCloudSyncSnapshotsEnabled: Bool
+    var iCloudSyncShowFleetAccounts: Bool
+    var iCloudSyncDeviceID: String
 }

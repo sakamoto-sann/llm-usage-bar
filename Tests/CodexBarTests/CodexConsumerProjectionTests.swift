@@ -232,6 +232,129 @@ struct CodexConsumerProjectionTests {
     }
 
     @Test
+    func `monthly credit limit projects as the automatic meter before usage loads`() throws {
+        let store = self.makeStore(suite: "CodexConsumerProjectionTests-monthly-credit-meter")
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let monthlyLimit = CodexCreditLimitSnapshot(
+            used: 27,
+            limit: 100,
+            remainingPercent: 73,
+            resetsAt: now.addingTimeInterval(14 * 24 * 60 * 60),
+            updatedAt: now)
+
+        store._setSnapshotForTesting(nil, provider: .codex)
+        store.credits = CreditsSnapshot(
+            remaining: 0,
+            events: [],
+            updatedAt: now,
+            codexCreditLimit: monthlyLimit)
+
+        let projection = store.codexConsumerProjection(surface: .menuBar, now: now)
+        let monthly = try #require(projection.rateWindow(for: .monthly))
+
+        #expect(projection.visibleRateLanes == [.monthly])
+        #expect(monthly.usedPercent == 27)
+        #expect(monthly.remainingPercent == 73)
+        #expect(projection.automaticMenuBarWindow() == monthly)
+        #expect(CodexConsumerProjection.rateTitle(
+            lane: .monthly,
+            windowMinutes: monthly.windowMinutes,
+            sessionLabel: "Session",
+            weeklyLabel: "Weekly") == "Monthly credit limit")
+    }
+
+    @Test
+    func `monthly credit limit projects when usage has no rate windows`() {
+        let store = self.makeStore(suite: "CodexConsumerProjectionTests-empty-usage-credit-meter")
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        store._setSnapshotForTesting(
+            UsageSnapshot(primary: nil, secondary: nil, updatedAt: now),
+            provider: .codex)
+        store.credits = CreditsSnapshot(
+            remaining: 0,
+            events: [],
+            updatedAt: now,
+            codexCreditLimit: CodexCreditLimitSnapshot(
+                used: 27,
+                limit: 100,
+                remainingPercent: 73,
+                resetsAt: nil,
+                updatedAt: now))
+
+        let projection = store.codexConsumerProjection(surface: .menuBar, now: now)
+
+        #expect(projection.visibleRateLanes == [.monthly])
+        #expect(projection.rateWindow(for: .monthly)?.remainingPercent == 73)
+    }
+
+    @Test
+    func `monthly credit limit remains a credits detail on the live card`() {
+        let store = self.makeStore(suite: "CodexConsumerProjectionTests-live-card-credits")
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        store._setSnapshotForTesting(
+            UsageSnapshot(primary: nil, secondary: nil, updatedAt: now),
+            provider: .codex)
+        store.credits = CreditsSnapshot(
+            remaining: 0,
+            events: [],
+            updatedAt: now,
+            codexCreditLimit: CodexCreditLimitSnapshot(
+                used: 27,
+                limit: 100,
+                remainingPercent: 73,
+                resetsAt: nil,
+                updatedAt: now))
+
+        let projection = store.codexConsumerProjection(surface: .liveCard, now: now)
+
+        #expect(projection.credits != nil)
+        #expect(projection.rateWindow(for: .monthly) == nil)
+        #expect(projection.visibleRateLanes.isEmpty)
+    }
+
+    @Test
+    func `existing rate limit meter wins over monthly credit limit`() {
+        let store = self.makeStore(suite: "CodexConsumerProjectionTests-rate-limit-priority")
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let primary = RateWindow(
+            usedPercent: 12,
+            windowMinutes: 300,
+            resetsAt: now.addingTimeInterval(3600),
+            resetDescription: nil)
+
+        store._setSnapshotForTesting(
+            UsageSnapshot(
+                primary: primary,
+                secondary: nil,
+                updatedAt: now,
+                identity: ProviderIdentitySnapshot(
+                    providerID: .codex,
+                    accountEmail: "team@example.com",
+                    accountOrganization: "Team",
+                    loginMethod: "team")),
+            provider: .codex)
+        store.credits = CreditsSnapshot(
+            remaining: 0,
+            events: [],
+            updatedAt: now,
+            codexCreditLimit: CodexCreditLimitSnapshot(
+                used: 90,
+                limit: 100,
+                remainingPercent: 10,
+                resetsAt: now.addingTimeInterval(14 * 24 * 60 * 60),
+                updatedAt: now))
+
+        let projection = store.codexConsumerProjection(surface: .menuBar, now: now)
+
+        #expect(projection.visibleRateLanes == [.session])
+        #expect(projection.rateWindow(for: .session) == primary)
+        #expect(projection.rateWindow(for: .monthly) == nil)
+        #expect(projection.automaticMenuBarWindow() == primary)
+    }
+
+    @Test
     func `exhausted weekly lane caps session display until weekly reset`() throws {
         let store = self.makeStore(suite: "CodexConsumerProjectionTests-weekly-caps-session")
         let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -470,6 +593,82 @@ struct CodexConsumerProjectionTests {
         #expect(session.resetsAt == sessionReset)
     }
 
+    @Test
+    func `thirty day primary window maps to a monthly lane instead of session`() {
+        let store = self.makeStore(suite: "CodexConsumerProjectionTests-30day-primary")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        store._setSnapshotForTesting(
+            UsageSnapshot(
+                primary: RateWindow(
+                    usedPercent: 55,
+                    windowMinutes: 43200,
+                    resetsAt: now.addingTimeInterval(24 * 86400),
+                    resetDescription: nil),
+                secondary: RateWindow(
+                    usedPercent: 5,
+                    windowMinutes: 10080,
+                    resetsAt: now.addingTimeInterval(7 * 86400),
+                    resetDescription: nil),
+                updatedAt: now),
+            provider: .codex)
+
+        let projection = store.codexConsumerProjection(surface: .liveCard, now: now)
+
+        #expect(projection.visibleRateLanes == [.monthly, .weekly])
+        #expect(projection.rateWindow(for: .session) == nil)
+        #expect(projection.rateWindow(for: .monthly)?.windowMinutes == 43200)
+        #expect(projection.planUtilizationLanes.map(\.role.rawValue) == ["weekly", "monthly"])
+    }
+
+    @Test
+    func `automatic menu bar metric prefers the weekly window over a thirty day primary`() {
+        let store = self.makeStore(suite: "CodexConsumerProjectionTests-30day-automatic")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let snapshot = UsageSnapshot(
+            primary: RateWindow(
+                usedPercent: 55,
+                windowMinutes: 43200,
+                resetsAt: now.addingTimeInterval(24 * 86400),
+                resetDescription: nil),
+            secondary: RateWindow(
+                usedPercent: 5,
+                windowMinutes: 10080,
+                resetsAt: now.addingTimeInterval(7 * 86400),
+                resetDescription: nil),
+            updatedAt: now)
+
+        let projection = store.codexConsumerProjection(
+            surface: .menuBar,
+            snapshotOverride: snapshot,
+            now: now)
+
+        #expect(projection.automaticMenuBarWindow()?.windowMinutes == 10080)
+        #expect(store.codexMenuBarMetricWindow(snapshot: snapshot, now: now)?.windowMinutes == 10080)
+    }
+
+    @Test
+    func `automatic menu bar metric keeps the standard five hour session primary`() {
+        let store = self.makeStore(suite: "CodexConsumerProjectionTests-standard-automatic")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let snapshot = UsageSnapshot(
+            primary: RateWindow(
+                usedPercent: 55,
+                windowMinutes: 300,
+                resetsAt: now.addingTimeInterval(3 * 3600),
+                resetDescription: nil),
+            secondary: RateWindow(
+                usedPercent: 5,
+                windowMinutes: 10080,
+                resetsAt: now.addingTimeInterval(7 * 86400),
+                resetDescription: nil),
+            updatedAt: now)
+
+        let window = store.codexMenuBarMetricWindow(snapshot: snapshot, now: now)
+
+        #expect(window?.windowMinutes == 300)
+    }
+
     private func makeStore(suite: String) -> UsageStore {
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
@@ -487,7 +686,6 @@ struct CodexConsumerProjectionTests {
             minimaxCookieStore: InMemoryMiniMaxCookieStore(),
             minimaxAPITokenStore: InMemoryMiniMaxAPITokenStore(),
             kimiTokenStore: InMemoryKimiTokenStore(),
-            kimiK2TokenStore: InMemoryKimiK2TokenStore(),
             augmentCookieStore: InMemoryCookieHeaderStore(),
             ampCookieStore: InMemoryCookieHeaderStore(),
             copilotTokenStore: InMemoryCopilotTokenStore(),

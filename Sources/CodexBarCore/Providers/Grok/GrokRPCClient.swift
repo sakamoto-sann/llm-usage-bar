@@ -6,7 +6,7 @@ import Foundation
 /// but uses `protocolVersion`/`clientCapabilities` for the `initialize` call instead of
 /// `clientInfo`. Billing is fetched via the `x.ai/billing` extension method.
 final class GrokRPCClient: @unchecked Sendable {
-    private static let log = CodexBarLog.logger(LogCategories.grok)
+    private static let log = CodexBarLog.logger(LogCategories.provider(.grok))
 
     private let process = Process()
     private let stdinPipe = Pipe()
@@ -61,7 +61,9 @@ final class GrokRPCClient: @unchecked Sendable {
 
         let stdoutHandle = self.stdoutPipe.fileHandleForReading
         let stdoutLineContinuation = self.stdoutLineContinuation
-        let stdoutBuffer = LineBuffer()
+        let stdoutBuffer = BoundedLineBuffer()
+        let process = self.process
+        let stdinPipe = self.stdinPipe
         stdoutHandle.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
@@ -69,8 +71,17 @@ final class GrokRPCClient: @unchecked Sendable {
                 stdoutLineContinuation.finish()
                 return
             }
-            let lines = stdoutBuffer.appendAndDrainLines(data)
-            for lineData in lines {
+            let result = stdoutBuffer.appendAndDrainLines(data)
+            if result.didExceedLimit {
+                Self.log.warning("Grok RPC line exceeded memory limit; terminating process")
+                handle.readabilityHandler = nil
+                DispatchQueue.global(qos: .userInitiated).async {
+                    RPCChildProcessTeardown.terminate(process: process, stdinPipe: stdinPipe)
+                }
+                stdoutLineContinuation.finish()
+                return
+            }
+            for lineData in result.lines {
                 stdoutLineContinuation.yield(lineData)
             }
         }
@@ -116,10 +127,8 @@ final class GrokRPCClient: @unchecked Sendable {
     }
 
     func shutdown() {
-        if self.process.isRunning {
-            Self.log.debug("Grok RPC stopping")
-            self.process.terminate()
-        }
+        Self.log.debug("Grok RPC stopping")
+        RPCChildProcessTeardown.terminate(process: self.process, stdinPipe: self.stdinPipe)
     }
 
     // MARK: - JSON-RPC plumbing (mirrors CodexRPCClient)
@@ -182,7 +191,13 @@ final class GrokRPCClient: @unchecked Sendable {
     private func terminateProcessForTimeout(method: String) {
         if self.process.isRunning {
             Self.log.warning("Grok RPC timed out on `\(method)`; terminating process")
-            self.process.terminate()
+        }
+        // Dispatch off the timeout task so the bounded TERM-to-KILL wait cannot delay the timeout
+        // error or let the stdout-EOF failure win the race; `shutdown()` remains the synchronous backstop.
+        let process = self.process
+        let stdinPipe = self.stdinPipe
+        DispatchQueue.global(qos: .userInitiated).async {
+            RPCChildProcessTeardown.terminate(process: process, stdinPipe: stdinPipe)
         }
     }
 
@@ -241,26 +256,6 @@ final class GrokRPCClient: @unchecked Sendable {
         case let int as Int: int
         case let number as NSNumber: number.intValue
         default: nil
-        }
-    }
-
-    private final class LineBuffer: @unchecked Sendable {
-        private var buffer = Data()
-        private let lock = NSLock()
-
-        func appendAndDrainLines(_ data: Data) -> [Data] {
-            self.lock.lock()
-            defer { lock.unlock() }
-            self.buffer.append(data)
-            var out: [Data] = []
-            while let newline = self.buffer.firstIndex(of: 0x0A) {
-                let lineData = Data(self.buffer[..<newline])
-                self.buffer.removeSubrange(...newline)
-                if !lineData.isEmpty {
-                    out.append(lineData)
-                }
-            }
-            return out
         }
     }
 }

@@ -23,9 +23,11 @@ struct ClaudeProviderImplementation: ProviderImplementation {
         _ = settings.claudeCookieSource
         _ = settings.claudeCookieHeader
         _ = settings.claudeOAuthKeychainPromptMode
+        _ = settings.claudeOAuthDirectKeychainReadAllowed
         _ = settings.claudeOAuthKeychainReadStrategy
         _ = settings.claudeWebExtrasEnabled
         _ = settings.claudeSwapEnabled
+        _ = settings.claudeSwapShowSingleAccount
         _ = settings.claudeSwapExecutablePath
     }
 
@@ -86,8 +88,43 @@ struct ClaudeProviderImplementation: ProviderImplementation {
         let claudeSwapBinding = Binding(
             get: { context.settings.claudeSwapEnabled },
             set: { context.settings.claudeSwapEnabled = $0 })
+        let claudeSwapShowSingleAccountBinding = Binding(
+            get: { context.settings.claudeSwapShowSingleAccount },
+            set: { context.settings.claudeSwapShowSingleAccount = $0 })
 
         return [
+            ProviderSettingsToggleDescriptor(
+                id: "claude-daily-routines-usage-visible",
+                title: "Show Daily Routines usage",
+                subtitle: [
+                    "Shows the Daily Routines quota row in the menu and provider preview.",
+                    "Requires optional credits and extra usage in Display settings.",
+                ].joined(separator: " "),
+                binding: context.boolBinding(\.claudeDailyRoutinesUsageVisible),
+                statusText: nil,
+                actions: [],
+                isVisible: nil,
+                isEnabled: { context.settings.showOptionalCreditsAndExtraUsage },
+                onChange: nil,
+                onAppDidBecomeActive: nil,
+                onAppearWhenEnabled: nil),
+            ProviderSettingsToggleDescriptor(
+                id: "claude-oauth-direct-keychain-read",
+                title: "Allow reading Claude Code's credentials",
+                subtitle: [
+                    "Reads Claude Code's Keychain item for OAuth usage; macOS may ask for permission.",
+                    "Off: CodexBar never touches Claude Code's credentials and uses the Claude CLI instead.",
+                ].joined(separator: " "),
+                binding: Binding(
+                    get: { context.settings.claudeOAuthDirectKeychainReadAllowed },
+                    set: { context.settings.claudeOAuthDirectKeychainReadAllowed = $0 }),
+                statusText: nil,
+                actions: [],
+                isVisible: nil,
+                isEnabled: { !context.settings.debugDisableKeychainAccess },
+                onChange: nil,
+                onAppDidBecomeActive: nil,
+                onAppearWhenEnabled: nil),
             ProviderSettingsToggleDescriptor(
                 id: "claude-oauth-prompt-free-credentials",
                 title: "Avoid Keychain prompts",
@@ -109,6 +146,18 @@ struct ClaudeProviderImplementation: ProviderImplementation {
                 statusText: { Self.claudeSwapStatusText(store: context.store, settings: context.settings) },
                 actions: [],
                 isVisible: nil,
+                isEnabled: nil,
+                onChange: nil,
+                onAppDidBecomeActive: nil,
+                onAppearWhenEnabled: nil),
+            ProviderSettingsToggleDescriptor(
+                id: "claude-swap-show-single-account",
+                title: "Show account card when only one account is available",
+                subtitle: "Prefer claude-swap over the ambient Claude account presentation.",
+                binding: claudeSwapShowSingleAccountBinding,
+                statusText: nil,
+                actions: [],
+                isVisible: { context.settings.claudeSwapEnabled },
                 isEnabled: nil,
                 onChange: nil,
                 onAppDidBecomeActive: nil,
@@ -267,9 +316,22 @@ struct ClaudeProviderImplementation: ProviderImplementation {
            context.settings.showOptionalCreditsAndExtraUsage,
            cost.currencyCode != "Quota"
         {
-            let used = UsageFormatter.currencyString(cost.used, currencyCode: cost.currencyCode)
-            let limit = UsageFormatter.currencyString(cost.limit, currencyCode: cost.currencyCode)
-            entries.append(.text(String(format: L("extra_usage_format"), used, limit), .primary))
+            func formatCost(_ value: Double) -> String {
+                UsageFormatter.convertedCostString(
+                    value,
+                    preferredCurrency: context.settings.preferredCurrencyCode,
+                    providerCurrency: cost.currencyCode)
+            }
+            if cost.limit > 0 {
+                let used = formatCost(cost.used)
+                let limit = formatCost(cost.limit)
+                entries.append(.text(String(format: L("extra_usage_format"), used, limit), .primary))
+            }
+            if let balance = cost.balance {
+                let value = formatCost(balance)
+                let label = cost.limit > 0 ? L("Balance") : L("Credits")
+                entries.append(.text("\(label): \(value)", .primary))
+            }
         }
     }
 
@@ -277,13 +339,31 @@ struct ClaudeProviderImplementation: ProviderImplementation {
     func loginMenuAction(context: ProviderMenuLoginContext)
         -> (label: String, action: MenuDescriptor.MenuAction)?
     {
+        if self.shouldOfferDirectKeychainReadConsent(context: context) {
+            // Terminal unreadable state (#2634/#2650): OAuth cannot recover until the user either opts in
+            // to reading Claude Code's Keychain item or usage arrives via the Claude CLI fallback.
+            return ("Allow reading Claude Code's credentials in Settings…", .settings)
+        }
         if self.shouldOpenBrowserForWebSessionError(context: context) {
             return ("Re-login at claude.ai", .loginToProvider(url: "https://claude.ai/"))
         }
         if self.shouldOpenTerminalForOAuthError(store: context.store) {
             return ("Open Terminal", .openTerminal(command: "claude"))
         }
+        let swapOwnsAccountPresentation = ClaudeSwapMenuPrecedence.prefersClaudeSwap(
+            provider: context.provider,
+            accountCount: context.store.claudeSwapAccountSnapshots.count,
+            showSingleAccount: context.settings.claudeSwapShowSingleAccount)
+        guard !context.hasAccount || swapOwnsAccountPresentation else { return nil }
         return (L("Sign in with Claude Code..."), .switchAccount(.claude))
+    }
+
+    @MainActor
+    private func shouldOfferDirectKeychainReadConsent(context: ProviderMenuLoginContext) -> Bool {
+        guard !context.settings.claudeOAuthDirectKeychainReadAllowed,
+              !context.settings.debugDisableKeychainAccess
+        else { return false }
+        return ClaudeOAuthUnreadableCredentialsError.matches(description: context.store.error(for: .claude))
     }
 
     @MainActor

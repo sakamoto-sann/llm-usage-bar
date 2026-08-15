@@ -10,6 +10,11 @@ import Musl
 import Security
 #endif
 
+#if os(Linux)
+@_silgen_name("pipe2")
+private func linuxPipe2(_ pipeDescriptors: UnsafeMutablePointer<Int32>, _ flags: Int32) -> Int32
+#endif
+
 public enum PathPurpose: Hashable, Sendable {
     case rpc
     case tty
@@ -59,6 +64,7 @@ public enum BinaryLocator {
         fileManager: FileManager = .default,
         home: String = NSHomeDirectory()) -> String?
     {
+        // Provider-specific by design: This named resolver supplies Claude's actual CLI executable name.
         self.resolveBinary(
             name: "claude",
             overrideKey: "CLAUDE_CLI_PATH",
@@ -67,6 +73,31 @@ public enum BinaryLocator {
             commandV: commandV,
             aliasResolver: aliasResolver,
             wellKnownPaths: self.claudeWellKnownPaths(home: home),
+            fileManager: fileManager,
+            home: home)
+    }
+
+    public static func resolveArkcliBinary(
+        env: [String: String] = ProcessInfo.processInfo.environment,
+        loginPATH: [String]? = LoginShellPathCache.shared.current,
+        commandV: (String, String?, TimeInterval, FileManager) -> String? = ShellCommandLocator.commandV,
+        aliasResolver: (String, String?, TimeInterval, FileManager, String) -> String? = ShellCommandLocator
+            .resolveAlias,
+        fileManager: FileManager = .default,
+        home: String = NSHomeDirectory()) -> String?
+    {
+        self.resolveBinary(
+            name: "arkcli",
+            overrideKey: "ARKCLI_PATH",
+            env: env,
+            loginPATH: loginPATH,
+            commandV: commandV,
+            aliasResolver: aliasResolver,
+            wellKnownPaths: [
+                "\(home)/.local/bin/arkcli",
+                "/opt/homebrew/bin/arkcli",
+                "/usr/local/bin/arkcli",
+            ],
             fileManager: fileManager,
             home: home)
     }
@@ -121,6 +152,7 @@ public enum BinaryLocator {
         fileManager: FileManager = .default,
         home: String = NSHomeDirectory()) -> String?
     {
+        // Provider-specific by design: This named resolver supplies Codex's actual CLI executable name.
         self.resolveBinary(
             name: "codex",
             overrideKey: "CODEX_CLI_PATH",
@@ -163,6 +195,7 @@ public enum BinaryLocator {
         {
             return override
         }
+        // Provider-specific by design: This named resolver supplies Gemini's actual CLI executable name.
         return self.resolveBinary(
             name: "gemini",
             overrideKey: "GEMINI_CLI_PATH",
@@ -183,6 +216,7 @@ public enum BinaryLocator {
         fileManager: FileManager = .default,
         home: String = NSHomeDirectory()) -> String?
     {
+        // Provider-specific by design: This named resolver supplies Grok's actual CLI executable name.
         self.resolveBinary(
             name: "grok",
             overrideKey: "GROK_CLI_PATH",
@@ -204,6 +238,7 @@ public enum BinaryLocator {
         fileManager: FileManager = .default,
         home: String = NSHomeDirectory()) -> String?
     {
+        // Provider-specific by design: This named resolver supplies Amp's actual CLI executable name.
         self.resolveBinary(
             name: "amp",
             overrideKey: "AMP_CLI_PATH",
@@ -640,12 +675,27 @@ public enum CodexLaunchPreflight {
 }
 
 public enum ShellCommandLocator {
+    #if canImport(Darwin)
+    private static let shellSpawnFlags = Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)
+    #else
+    private static let shellSpawnFlags: Int16 = 0x80 // glibc/musl POSIX_SPAWN_SETSID.
+    #endif
+    private static let shellSpawnLock = NSLock()
+
     static func test_runShellCommand(
         shell: String,
         arguments: [String],
         timeout: TimeInterval) -> Data?
     {
         self.runShellCommand(shell: shell, arguments: arguments, timeout: timeout)
+    }
+
+    static func test_makeCloseOnExecPipe() -> (read: Int32, write: Int32)? {
+        self.makeCloseOnExecPipe()
+    }
+
+    static var test_shellSpawnFlags: Int16 {
+        self.shellSpawnFlags
     }
 
     public static func commandV(
@@ -723,35 +773,66 @@ public enum ShellCommandLocator {
         func fire() -> Bool {
             self.lock.lock()
             defer { self.lock.unlock() }
-            if self.fired { return false }
+            if self.fired {
+                return false
+            }
             self.fired = true
             return true
         }
+    }
+
+    private static func makeCloseOnExecPipe() -> (read: Int32, write: Int32)? {
+        var fds: (read: Int32, write: Int32) = (-1, -1)
+        #if os(Linux)
+        // Glibc and Musl export pipe2, but their Swift modules do not consistently declare it.
+        guard withUnsafeMutablePointer(to: &fds, {
+            $0.withMemoryRebound(to: Int32.self, capacity: 2) { linuxPipe2($0, O_CLOEXEC) == 0 }
+        }) else { return nil }
+        #else
+        guard withUnsafeMutablePointer(to: &fds, {
+            $0.withMemoryRebound(to: Int32.self, capacity: 2) { pipe($0) == 0 }
+        }) else { return nil }
+
+        for fd in [fds.read, fds.write] {
+            let flags = fcntl(fd, F_GETFD)
+            guard flags >= 0, fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+                close(fds.read)
+                close(fds.write)
+                return nil
+            }
+        }
+        #endif
+        return fds
     }
 
     // swiftlint:disable cyclomatic_complexity
     /// Runs a shell command, draining both stdout and stderr concurrently so that
     /// verbose shell init scripts (oh-my-zsh, nvm, pyenv, etc.) cannot deadlock on
     /// a full pipe buffer.  The child is launched via `posix_spawn` with
-    /// `POSIX_SPAWN_SETPGROUP` so it becomes its own process-group leader *before*
-    /// `exec`, which guarantees that subsequent `kill(-pgid, ...)` calls reach any
-    /// background helpers spawned by shell init, on both the timeout-kill path and
-    /// after normal completion.
+    /// `POSIX_SPAWN_SETSID` so it cannot take ownership of the caller's controlling
+    /// terminal. The new session also makes the child its own process-group leader;
+    /// cleanup tracks both that group and helpers retaining the command's output pipes.
     fileprivate static func runShellCommand(
         shell: String,
         arguments: [String],
         timeout: TimeInterval) -> Data?
     {
+        // Darwin needs a lock around raw descriptor creation, close-on-exec flagging,
+        // and spawn. Linux creates close-on-exec descriptors atomically with pipe2.
+        self.shellSpawnLock.lock()
+        var shellSpawnLockHeld = true
+        defer {
+            if shellSpawnLockHeld {
+                self.shellSpawnLock.unlock()
+            }
+        }
+
         // Pipes for stdout/stderr.  stdin is redirected from /dev/null in the child
-        // via posix_spawn_file_actions_addopen below.
-        var stdoutFds: (read: Int32, write: Int32) = (-1, -1)
-        var stderrFds: (read: Int32, write: Int32) = (-1, -1)
-        guard withUnsafeMutablePointer(to: &stdoutFds, {
-            $0.withMemoryRebound(to: Int32.self, capacity: 2) { pipe($0) == 0 }
-        }) else { return nil }
-        guard withUnsafeMutablePointer(to: &stderrFds, {
-            $0.withMemoryRebound(to: Int32.self, capacity: 2) { pipe($0) == 0 }
-        }) else {
+        // via posix_spawn_file_actions_addopen below. Close-on-exec prevents a
+        // concurrently spawned probe from retaining these descriptors and being
+        // mistaken for one of this probe's output holders during cleanup.
+        guard let stdoutFds = self.makeCloseOnExecPipe() else { return nil }
+        guard let stderrFds = self.makeCloseOnExecPipe() else {
             close(stdoutFds.read); close(stdoutFds.write)
             return nil
         }
@@ -779,8 +860,9 @@ public enum ShellCommandLocator {
         posix_spawn_file_actions_addclose(&fileActions, stderrFds.read)
         posix_spawn_file_actions_addclose(&fileActions, stderrFds.write)
 
-        // Build attributes: set the child's process group to itself in the child,
-        // before exec, eliminating the race that an after-launch setpgid(2) has.
+        // Build attributes: detach the child into a new session before exec. This
+        // prevents interactive shell startup from changing the caller's foreground
+        // process group while retaining a stable process group for cleanup.
         #if canImport(Darwin)
         var attr: posix_spawnattr_t?
         #else
@@ -792,8 +874,11 @@ public enum ShellCommandLocator {
             return nil
         }
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
-        posix_spawnattr_setpgroup(&attr, 0) // 0 = child becomes its own pgid leader
+        guard posix_spawnattr_setflags(&attr, self.shellSpawnFlags) == 0 else {
+            close(stdoutFds.read); close(stdoutFds.write)
+            close(stderrFds.read); close(stderrFds.write)
+            return nil
+        }
 
         // Build argv (argv[0] is conventionally the executable path).
         var cArgs: [UnsafeMutablePointer<CChar>?] = []
@@ -834,14 +919,13 @@ public enum ShellCommandLocator {
         // once every descendant in the process group also closes them.
         close(stdoutFds.write)
         close(stderrFds.write)
+        self.shellSpawnLock.unlock()
+        shellSpawnLockHeld = false
 
         guard spawnResult == 0 else {
             close(stdoutFds.read); close(stderrFds.read)
             return nil
         }
-
-        // POSIX_SPAWN_SETPGROUP with pgroup=0 guarantees the child's pgid == its pid.
-        let pgid: pid_t = pid
 
         // Track EOF on each pipe so we can wait for full drain instead of sleeping.
         // The readability handler fires with empty data when every writer end is
@@ -858,7 +942,9 @@ public enum ShellCommandLocator {
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                if stdoutDone.fire() { drainGroup.leave() }
+                if stdoutDone.fire() {
+                    drainGroup.leave()
+                }
             } else {
                 stdoutCollector.append(data)
             }
@@ -869,53 +955,53 @@ public enum ShellCommandLocator {
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                if stderrDone.fire() { drainGroup.leave() }
+                if stderrDone.fire() {
+                    drainGroup.leave()
+                }
             }
         }
 
-        // Reap the child on a background queue and signal a semaphore on exit.
-        let exitSemaphore = DispatchSemaphore(value: 0)
-        let waitPid = pid
-        DispatchQueue.global(qos: .userInitiated).async {
-            var status: Int32 = 0
-            while waitpid(waitPid, &status, 0) == -1, errno == EINTR {
-                // retry
-            }
-            exitSemaphore.signal()
+        // Adopt the already-spawned session so cleanup can also discover helpers
+        // that escape into a new process group while retaining our output pipes.
+        let process = SpawnedProcessGroup.adopt(
+            pid: pid,
+            outputFileDescriptors: [stdoutFds.read, stderrFds.read])
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning, Date() < deadline {
+            usleep(10000)
         }
 
-        let finishedInTime = exitSemaphore.wait(timeout: .now() + timeout) == .success
-
-        if !finishedInTime {
-            kill(-pgid, SIGTERM)
-            kill(pid, SIGTERM)
-            if exitSemaphore.wait(timeout: .now() + 0.4) != .success {
-                kill(-pgid, SIGKILL)
-                kill(pid, SIGKILL)
-                _ = exitSemaphore.wait(timeout: .now() + 1.0)
-            }
+        if process.isRunning {
+            process.terminateSynchronously()
             stdoutHandle.readabilityHandler = nil
             stderrHandle.readabilityHandler = nil
-            if stdoutDone.fire() { drainGroup.leave() }
-            if stderrDone.fire() { drainGroup.leave() }
+            if stdoutDone.fire() {
+                drainGroup.leave()
+            }
+            if stderrDone.fire() {
+                drainGroup.leave()
+            }
             return nil
         }
 
-        // Normal completion — clean up any background children spawned by shell init.
-        // Without this, helpers that inherited stdout/stderr keep the pipe write ends
-        // open and we never see EOF on the read ends.
-        kill(-pgid, SIGTERM)
+        // Normal completion — clean up background children spawned by shell init,
+        // including session-escaped helpers that still hold our output pipes open.
+        process.terminateSynchronously()
 
         // Wait for both pipes to deliver EOF so no buffered bytes are lost.
         // Bounded so a stuck handler can't hang the caller indefinitely.
         if drainGroup.wait(timeout: .now() + 0.4) != .success {
-            kill(-pgid, SIGKILL)
+            process.terminateSynchronously(grace: 0)
         }
         if drainGroup.wait(timeout: .now() + 0.6) != .success {
             stdoutHandle.readabilityHandler = nil
             stderrHandle.readabilityHandler = nil
-            if stdoutDone.fire() { drainGroup.leave() }
-            if stderrDone.fire() { drainGroup.leave() }
+            if stdoutDone.fire() {
+                drainGroup.leave()
+            }
+            if stderrDone.fire() {
+                drainGroup.leave()
+            }
         }
         return stdoutCollector.drain()
     }
@@ -985,8 +1071,12 @@ public enum ShellCommandLocator {
     }
 
     private static func expandPath(_ raw: String, home: String) -> String {
-        if raw == "~" { return home }
-        if raw.hasPrefix("~/") { return home + String(raw.dropFirst()) }
+        if raw == "~" {
+            return home
+        }
+        if raw.hasPrefix("~/") {
+            return home + String(raw.dropFirst())
+        }
         return raw
     }
 }

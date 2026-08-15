@@ -1,8 +1,9 @@
 import CodexBarCore
 import Foundation
 
-private enum ConfigChangeOrigin {
+enum ConfigChangeOrigin: Equatable {
     case localUser
+    case localFile
     case externalSync
 }
 
@@ -15,22 +16,38 @@ private struct ConfigChangeContext {
         Self(origin: .localUser, reason: reason, affectsBackgroundWork: affectsBackgroundWork)
     }
 
-    static func external(reason: String, affectsBackgroundWork: Bool) -> Self {
-        Self(origin: .externalSync, reason: reason, affectsBackgroundWork: affectsBackgroundWork)
+    static func external(
+        origin: ConfigChangeOrigin = .externalSync,
+        reason: String,
+        affectsBackgroundWork: Bool) -> Self
+    {
+        Self(origin: origin, reason: reason, affectsBackgroundWork: affectsBackgroundWork)
     }
 
     var shouldBroadcast: Bool {
-        switch self.origin {
-        case .localUser:
-            true
-        case .externalSync:
-            false
-        }
+        self.origin == .localUser
+    }
+
+    var shouldNotifyCloudSync: Bool {
+        self.origin == .localFile
     }
 }
 
 extension SettingsStore {
-    private func updateConfig(
+    func startConfigFileWatcher() {
+        let watcher = ConfigFileWatcher(fileURL: self.configStore.fileURL) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.reloadConfig(reason: "file-watch", origin: .localFile)
+            }
+        }
+        if let data = try? Data(contentsOf: self.configStore.fileURL) {
+            watcher.noteAppWrite(data: data)
+        }
+        self.configFileWatcher = watcher
+        watcher.start()
+    }
+
+    func updateConfig(
         reason: String,
         affectsBackgroundWork: Bool,
         mutate: (inout CodexBarConfig) -> Void)
@@ -46,16 +63,50 @@ extension SettingsStore {
 
     func updateProviderConfig(provider: UsageProvider, mutate: (inout ProviderConfig) -> Void) {
         self.updateConfig(reason: "provider-\(provider.rawValue)", affectsBackgroundWork: true) { config in
-            if let index = config.providers.firstIndex(where: { $0.id == provider }) {
+            if let index = config.providers.firstIndex(where: { $0.id == provider.instanceID }) {
                 var entry = config.providers[index]
                 mutate(&entry)
                 config.providers[index] = entry
             } else {
-                var entry = ProviderConfig(id: provider)
+                var entry = ProviderConfig(id: provider.instanceID)
                 mutate(&entry)
                 config.providers.append(entry)
             }
         }
+    }
+
+    func updateHooks(_ mutate: (inout HooksConfig) -> Void) {
+        // Hooks never affect provider fetching, so mark the change as not affecting
+        // background work: the config persists and the pane re-renders (via
+        // configRevision), but no provider refresh is triggered.
+        self.updateConfig(reason: "hooks", affectsBackgroundWork: false) { config in
+            var hooks = config.hooks ?? HooksConfig()
+            mutate(&hooks)
+            config.hooks = (hooks.enabled || !hooks.events.isEmpty) ? hooks : nil
+        }
+    }
+
+    /// Persists provider settings that only affect an already-visible provider detail.
+    /// This avoids rebuilding status items and open menus for a local selection change.
+    func updateProviderDetailConfig(
+        provider: UsageProvider,
+        mutate: (inout ProviderConfig) -> Void)
+    {
+        guard !self.configLoading else { return }
+        var config = self.config
+        if let index = config.providers.firstIndex(where: { $0.id == provider.instanceID }) {
+            var entry = config.providers[index]
+            mutate(&entry)
+            config.providers[index] = entry
+        } else {
+            var entry = ProviderConfig(id: provider.instanceID)
+            mutate(&entry)
+            config.providers.append(entry)
+        }
+        self.config = config.normalized()
+        self.updateProviderState(config: self.config)
+        self.schedulePersistConfig()
+        self.providerDetailSettingsRevision &+= 1
     }
 
     func updateProviderTokenAccounts(_ accounts: [UsageProvider: ProviderTokenAccountData]) {
@@ -70,22 +121,23 @@ extension SettingsStore {
                 "summary": summary,
             ])
         self.updateConfig(reason: "token-accounts", affectsBackgroundWork: true) { config in
-            var seen: Set<UsageProvider> = []
+            var seen: Set<ProviderInstanceID> = []
             for index in config.providers.indices {
-                let provider = config.providers[index].id
-                config.providers[index].tokenAccounts = accounts[provider]
-                seen.insert(provider)
+                let instanceID = config.providers[index].id
+                let provider = instanceID.firstPartyProvider
+                config.providers[index].tokenAccounts = provider.flatMap { accounts[$0] }
+                seen.insert(instanceID)
             }
-            for (provider, data) in accounts where !seen.contains(provider) {
-                config.providers.append(ProviderConfig(id: provider, tokenAccounts: data))
+            for (provider, data) in accounts where !seen.contains(provider.instanceID) {
+                config.providers.append(ProviderConfig(id: provider.instanceID, tokenAccounts: data))
             }
         }
     }
 
-    func setProviderOrder(_ order: [UsageProvider]) {
+    func setProviderOrder(_ order: [ProviderInstanceID]) {
         self.updateConfig(reason: "order", affectsBackgroundWork: false) { config in
             let configsByID = Dictionary(uniqueKeysWithValues: config.providers.map { ($0.id, $0) })
-            var seen: Set<UsageProvider> = []
+            var seen: Set<ProviderInstanceID> = []
             var ordered: [ProviderConfig] = []
             ordered.reserveCapacity(max(order.count, config.providers.count))
 
@@ -95,22 +147,27 @@ extension SettingsStore {
                 ordered.append(configsByID[provider] ?? ProviderConfig(id: provider))
             }
 
-            for provider in UsageProvider.allCases where !seen.contains(provider) {
-                ordered.append(configsByID[provider] ?? ProviderConfig(id: provider))
+            for provider in UsageProvider.allCases where !seen.contains(provider.instanceID) {
+                ordered.append(configsByID[provider.instanceID] ?? ProviderConfig(id: provider.instanceID))
             }
 
             config.providers = ordered
         }
     }
 
-    func reloadConfig(reason: String, affectsBackgroundWork: Bool? = nil) {
+    func reloadConfig(
+        reason: String,
+        affectsBackgroundWork: Bool? = nil,
+        origin: ConfigChangeOrigin = .externalSync)
+    {
         guard !self.configLoading else { return }
         do {
             guard let loaded = try self.configStore.load() else { return }
             self.applyExternalConfig(
                 loaded,
                 reason: "reload-\(reason)",
-                affectsBackgroundWork: affectsBackgroundWork)
+                affectsBackgroundWork: affectsBackgroundWork,
+                origin: origin)
         } catch {
             CodexBarLog.logger(LogCategories.configStore).error("Failed to reload config: \(error)")
         }
@@ -119,7 +176,8 @@ extension SettingsStore {
     func applyExternalConfig(
         _ config: CodexBarConfig,
         reason: String,
-        affectsBackgroundWork: Bool? = nil)
+        affectsBackgroundWork: Bool? = nil,
+        origin: ConfigChangeOrigin = .externalSync)
     {
         guard !self.configLoading else { return }
         let normalized = config.normalized()
@@ -132,6 +190,7 @@ extension SettingsStore {
         self.updateProviderState(config: normalized)
         self.configLoading = false
         self.bumpConfigRevision(.external(
+            origin: origin,
             reason: "sync-\(reason)",
             affectsBackgroundWork: resolvedBackgroundWorkChange))
     }
@@ -169,6 +228,12 @@ extension SettingsStore {
             .debug(
                 "Config revision bumped (\(context.reason)) -> \(self.configRevision)",
                 metadata: ["backgroundWork": context.affectsBackgroundWork ? "1" : "0"])
+        if context.shouldNotifyCloudSync {
+            NotificationCenter.default.post(
+                name: .codexbarLocalConfigFileDidChange,
+                object: self,
+                userInfo: ["reason": context.reason])
+        }
         guard context.shouldBroadcast else { return }
         NotificationCenter.default.post(
             name: .codexbarProviderConfigDidChange,
@@ -191,13 +256,16 @@ extension SettingsStore {
         self.configPersistTask?.cancel()
         if Self.isRunningTests {
             do {
-                try self.configStore.save(self.config)
+                let data = try self.configStore.encodedData(for: self.config)
+                self.configFileWatcher?.noteAppWrite(data: data)
+                try self.configStore.saveEncodedData(data)
             } catch {
                 CodexBarLog.logger(LogCategories.configStore).error("Failed to persist config: \(error)")
             }
             return
         }
         let store = self.configStore
+        let watcher = self.configFileWatcher
         self.configPersistTask = Task { @MainActor in
             do {
                 try await Task.sleep(nanoseconds: 350_000_000)
@@ -206,9 +274,17 @@ extension SettingsStore {
             }
             guard !Task.isCancelled else { return }
             let snapshot = self.config
+            let data: Data
+            do {
+                data = try store.encodedData(for: snapshot)
+                watcher?.noteAppWrite(data: data)
+            } catch {
+                CodexBarLog.logger(LogCategories.configStore).error("Failed to encode config: \(error)")
+                return
+            }
             let error: (any Error)? = await Task.detached(priority: .utility) {
                 do {
-                    try store.save(snapshot)
+                    try store.saveEncodedData(data)
                     return nil
                 } catch {
                     return error

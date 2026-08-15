@@ -5,7 +5,7 @@ import Foundation
 extension SettingsStore {
     func tokenAccountsData(for provider: UsageProvider) -> ProviderTokenAccountData? {
         guard TokenAccountSupportCatalog.support(for: provider) != nil else { return nil }
-        return self.configSnapshot.providerConfig(for: provider)?.tokenAccounts
+        return self.configSnapshot.providerConfig(for: provider.instanceID)?.tokenAccounts
     }
 
     func tokenAccounts(for provider: UsageProvider) -> [ProviderTokenAccount] {
@@ -18,6 +18,19 @@ extension SettingsStore {
         return data.accounts[index]
     }
 
+    /// Returns the saved account that currently owns provider fetches and account-scoped state.
+    /// Cursor keeps saved manual credentials when browser login switches back to Automatic, but those credentials
+    /// stay passive until the user explicitly selects one again.
+    func effectiveSelectedTokenAccount(for provider: UsageProvider) -> ProviderTokenAccount? {
+        let support = TokenAccountSupportCatalog.support(for: provider)
+        if support?.selectedAccountRequiresManualCookieSource == true,
+           (self.providerConfig(for: provider)?.cookieSource ?? .auto) == .auto
+        {
+            return nil
+        }
+        return self.selectedTokenAccount(for: provider)
+    }
+
     func setActiveTokenAccountIndex(_ index: Int, for provider: UsageProvider) {
         guard let data = self.tokenAccountsData(for: provider), !data.accounts.isEmpty else { return }
         let clamped = min(max(index, 0), data.accounts.count - 1)
@@ -28,6 +41,7 @@ extension SettingsStore {
         self.updateProviderConfig(provider: provider) { entry in
             entry.tokenAccounts = updated
         }
+        self.applyTokenAccountCookieSourceIfNeeded(provider: provider)
         CodexBarLog.logger(LogCategories.tokenAccounts).info(
             "Active token account updated",
             metadata: [
@@ -76,7 +90,7 @@ extension SettingsStore {
             activeIndex: accounts.count)
         self.updateProviderConfig(provider: provider) { entry in
             entry.tokenAccounts = updated
-            if provider == .copilot {
+            if TokenAccountSupportCatalog.support(for: provider)?.clearsAPIKeyOnMutation == true {
                 entry.apiKey = nil
             }
         }
@@ -104,7 +118,9 @@ extension SettingsStore {
 
         let trimmedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let trimmedToken, trimmedToken.isEmpty { return }
+        if let trimmedToken, trimmedToken.isEmpty {
+            return
+        }
 
         let existing = data.accounts[index]
         let resolvedIdentifier: String?
@@ -154,7 +170,7 @@ extension SettingsStore {
             activeIndex: data.clampedActiveIndex())
         self.updateProviderConfig(provider: provider) { entry in
             entry.tokenAccounts = updated
-            if provider == .copilot {
+            if TokenAccountSupportCatalog.support(for: provider)?.clearsAPIKeyOnMutation == true {
                 entry.apiKey = nil
             }
         }
@@ -189,7 +205,7 @@ extension SettingsStore {
                     accounts: filtered,
                     activeIndex: nextActiveIndex)
             }
-            if provider == .copilot {
+            if TokenAccountSupportCatalog.support(for: provider)?.clearsAPIKeyOnMutation == true {
                 entry.apiKey = nil
             }
         }
@@ -206,7 +222,9 @@ extension SettingsStore {
     }
 
     func ensureTokenAccountsLoaded() {
-        if self.tokenAccountsLoaded { return }
+        if self.tokenAccountsLoaded {
+            return
+        }
         self.tokenAccountsLoaded = true
     }
 
@@ -216,8 +234,10 @@ extension SettingsStore {
         do {
             guard let loaded = try self.configStore.load() else { return }
             accounts = Dictionary(uniqueKeysWithValues: loaded.providers.compactMap { entry in
-                guard let data = entry.tokenAccounts else { return nil }
-                return (entry.id, data)
+                guard let provider = entry.id.firstPartyProvider,
+                      let data = entry.tokenAccounts
+                else { return nil }
+                return (provider, data)
             })
         } catch {
             log.error("Failed to reload token accounts: \(error)")
@@ -229,7 +249,9 @@ extension SettingsStore {
 
     func openTokenAccountsFile() {
         do {
-            try self.configStore.save(self.config)
+            let data = try self.configStore.encodedData(for: self.config)
+            self.configFileWatcher?.noteAppWrite(data: data)
+            try self.configStore.saveEncodedData(data)
         } catch {
             CodexBarLog.logger(LogCategories.tokenAccounts).error("Failed to persist config: \(error)")
             return
@@ -249,6 +271,7 @@ extension SettingsStore {
         removedAccount: ProviderTokenAccount,
         remainingAccounts: [ProviderTokenAccount])
     {
+        // Provider-specific by design: removing the final Antigravity account must delete its shared OAuth cache.
         guard provider == .antigravity else { return }
         guard let removedCredentials = AntigravityOAuthCredentialsStore.credentials(
             fromTokenAccountValue: removedAccount.token)

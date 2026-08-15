@@ -68,25 +68,68 @@ struct MenuPane: View {
 
             CostSummarySettingsSection(settings: self.settings, store: self.store)
 
-            Section {
-                Toggle(isOn: self.$settings.agentSessionsEnabled) {
-                    SettingsRowLabel(
-                        L("agent_sessions_title"),
-                        subtitle: L("agent_sessions_subtitle"))
-                }
-
-                TextField(L("agent_sessions_hosts_title"), text: self.$settings.agentSessionsManualHosts)
-                    .disabled(!self.settings.agentSessionsEnabled)
-            } header: {
-                Text(L("section_agent_sessions"))
-            } footer: {
-                SettingsSectionFooter(L("agent_sessions_footer"))
-            }
+            AgentSessionsSettingsSection(settings: self.settings)
         }
         .formStyle(.grouped)
         .toggleStyle(.switch)
         .scrollContentBackground(.hidden)
         .background(FocusResigningBackground())
+    }
+}
+
+@MainActor
+struct AgentSessionsSettingsSection: View {
+    @Bindable var settings: SettingsStore
+
+    var body: some View {
+        Section {
+            Toggle(isOn: self.$settings.agentSessionsEnabled) {
+                SettingsRowLabel(
+                    L("agent_sessions_title"),
+                    subtitle: L("agent_sessions_subtitle"))
+            }
+
+            SettingsMenuPicker(
+                selection: self.$settings.agentSessionLabelStyle,
+                options: MenuSettingsMenuOptions.agentSessionLabelStyles,
+                label: {
+                    SettingsRowLabel(
+                        L("agent_session_labels_title"),
+                        subtitle: L("agent_session_labels_subtitle"))
+                },
+                optionLabel: { style in
+                    Text(style.label)
+                })
+                .disabled(!self.settings.agentSessionsEnabled)
+
+            AgentSessionHostsEditor(settings: self.settings)
+        } header: {
+            Text(L("section_agent_sessions"))
+        } footer: {
+            SettingsSectionFooter(L("agent_sessions_footer"))
+        }
+    }
+}
+
+@MainActor
+struct AgentSessionHostsEditor: View {
+    static let inputFormatHint = "user@host, user@host"
+
+    @Bindable var settings: SettingsStore
+
+    var body: some View {
+        LabeledContent(L("agent_sessions_hosts_title")) {
+            TextField(
+                L("agent_sessions_hosts_title"),
+                text: self.$settings.agentSessionsManualHosts,
+                prompt: Text(verbatim: Self.inputFormatHint))
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 220, idealWidth: 280)
+                .accessibilityLabel(L("agent_sessions_hosts_title"))
+        }
+        .disabled(!self.settings.agentSessionsEnabled)
+        .help(L("agent_sessions_footer"))
     }
 }
 
@@ -124,18 +167,33 @@ struct CostSummarySettingsSection: View {
                 SettingsSectionFooter {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(L("cost_auto_refresh_info"))
-                        self.costStatusLine(provider: .claude)
-                        self.costStatusLine(provider: .codex)
+                        ForEach(Self.costStatusProviders, id: \.self) { provider in
+                            self.costStatusLine(provider: provider)
+                        }
+                        Text(Self.costDataExplanation())
                     }
                 }
             }
         }
     }
 
+    static func costDataExplanation() -> String {
+        L("cost_data_explanation")
+    }
+
+    static var costStatusProviders: [UsageProvider] {
+        ProviderDescriptorRegistry.all.compactMap { descriptor -> (UsageProvider, Int)? in
+            guard let order = descriptor.tokenCost.settingsStatusOrder else { return nil }
+            return (descriptor.id, order)
+        }
+        .sorted { $0.1 < $1.1 }
+        .map(\.0)
+    }
+
     private func costStatusLine(provider: UsageProvider) -> Text {
         let name = ProviderDescriptorRegistry.descriptor(for: provider).metadata.displayName
 
-        guard provider == .claude || provider == .codex else {
+        guard ProviderDescriptorRegistry.descriptor(for: provider).tokenCost.supportsTokenCost else {
             return Text(String(format: L("cost_status_unsupported"), name))
         }
 

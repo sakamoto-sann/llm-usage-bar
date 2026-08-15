@@ -28,6 +28,9 @@ You can also configure the API key in CodexBar Settings → Providers → OpenRo
 
 ### CLI config
 
+To monitor multiple OpenRouter accounts, add labeled API keys in the same provider settings. CodexBar fetches each
+key independently. Choose the segmented account switcher or stacked account cards under Settings → Display.
+
 ```bash
 printf '%s' "$OPENROUTER_API_KEY" | codexbar config set-api-key --provider openrouter --stdin
 ```
@@ -39,6 +42,9 @@ The OpenRouter provider fetches usage data from two API endpoints:
 1. **Credits API** (`/api/v1/credits`): Returns total credits purchased and total usage. The balance is calculated as `total_credits - total_usage`.
 
 2. **Key API** (`/api/v1/key`): Returns rate limit information plus current daily, weekly, and monthly spend for your API key.
+
+The Key API is optional enrichment with a one-second production deadline. If it is slow or unavailable, CodexBar still
+shows the credits balance and labels the API-key budget as unavailable with a safe timeout, HTTP, or response diagnostic.
 
 ## Display
 
@@ -54,6 +60,8 @@ The OpenRouter menu card shows:
 ```bash
 codexbar --provider openrouter
 codexbar -p or  # alias
+codexbar --provider openrouter --account Personal
+codexbar --provider openrouter --all-accounts --format json --pretty
 ```
 
 ## Environment Variables

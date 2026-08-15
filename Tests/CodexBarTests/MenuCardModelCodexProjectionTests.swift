@@ -696,8 +696,8 @@ struct MenuCardModelCodexProjectionTests {
         #expect(sparkWeekly.percent == 0)
         #expect(sparkWeekly.percentLabel == "0% left")
         #expect(sparkWeekly.resetText != nil)
-        #expect(sparkWeekly.detailLeftText == "86% in deficit")
-        #expect(sparkWeekly.detailRightText == "Runs out now")
+        #expect(sparkWeekly.detailLeftText == nil)
+        #expect(sparkWeekly.detailRightText == nil)
         // Spark trails the core session/weekly lanes rather than replacing them.
         let sparkIndex = try #require(model.metrics.firstIndex { $0.id == "codex-spark" })
         let sparkWeeklyIndex = try #require(model.metrics.firstIndex { $0.id == "codex-spark-weekly" })
@@ -756,6 +756,72 @@ struct MenuCardModelCodexProjectionTests {
             now: now))
 
         #expect(model.creditsText == nil)
+    }
+
+    @Test
+    func `codex card titles follow window duration instead of slot position`() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let metadata = try #require(ProviderDefaults.metadata[.codex])
+        let snapshot = UsageSnapshot(
+            primary: RateWindow(
+                usedPercent: 55,
+                windowMinutes: 43200,
+                resetsAt: now.addingTimeInterval(24 * 86400),
+                resetDescription: nil),
+            secondary: RateWindow(
+                usedPercent: 5,
+                windowMinutes: 10080,
+                resetsAt: now.addingTimeInterval(6 * 86400),
+                resetDescription: nil),
+            tertiary: nil,
+            updatedAt: now,
+            identity: ProviderIdentitySnapshot(
+                providerID: .codex,
+                accountEmail: "user@example.com",
+                accountOrganization: nil,
+                loginMethod: "Pro"))
+        let projection = CodexConsumerProjection.make(
+            surface: .liveCard,
+            context: CodexConsumerProjection.Context(
+                snapshot: snapshot,
+                rawUsageError: nil,
+                liveCredits: nil,
+                rawCreditsError: nil,
+                liveDashboard: nil,
+                rawDashboardError: nil,
+                dashboardAttachmentAuthorized: false,
+                dashboardRequiresLogin: false,
+                now: now))
+
+        let model = UsageMenuCardView.Model.make(.init(
+            provider: .codex,
+            metadata: metadata,
+            snapshot: snapshot,
+            codexProjection: projection,
+            credits: nil,
+            creditsError: nil,
+            dashboard: nil,
+            dashboardError: nil,
+            tokenSnapshot: nil,
+            tokenError: nil,
+            account: AccountInfo(email: "user@example.com", plan: "Pro"),
+            isRefreshing: false,
+            lastError: nil,
+            usageBarsShowUsed: false,
+            resetTimeDisplayStyle: .countdown,
+            tokenCostUsageEnabled: false,
+            showOptionalCreditsAndExtraUsage: true,
+            codexSparkUsageVisible: false,
+            hidePersonalInfo: false,
+            now: now))
+
+        #expect(model.metrics.map(\.title) == ["Monthly", "Weekly"])
+        #expect(model.metrics.map(\.id) == ["monthly", "secondary"])
+        let monthly = try #require(model.metrics.first { $0.id == "monthly" })
+        #expect(monthly.detailLeftText == nil)
+        #expect(monthly.detailRightText == nil)
+        #expect(monthly.warningMarkerPercents.isEmpty)
+        #expect(monthly.resetText != nil)
     }
 }
 

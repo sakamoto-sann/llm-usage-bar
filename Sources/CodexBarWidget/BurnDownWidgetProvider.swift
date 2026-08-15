@@ -2,6 +2,8 @@ import AppIntents
 import CodexBarCore
 import WidgetKit
 
+/// Provider-specific by design: AppIntents requires compile-time enum cases and display representations;
+/// runtime presentation policy still comes from each provider descriptor below this literal WidgetKit surface.
 enum BurnProviderChoice: String, AppEnum {
     case codex
     case claude
@@ -34,6 +36,7 @@ enum BurnWindowChoice: String, AppEnum {
 }
 
 struct BurnDownSelectionIntent: AppIntent, WidgetConfigurationIntent {
+    // Provider-specific by design: the original burn-down widget defaults to Codex session usage.
     static let title: LocalizedStringResource = "Burn Down"
     static let description = IntentDescription("Select the provider and usage window to display.")
 
@@ -50,6 +53,7 @@ struct BurnDownSelectionIntent: AppIntent, WidgetConfigurationIntent {
 }
 
 struct BurnProviderSelectionIntent: AppIntent, WidgetConfigurationIntent {
+    // Provider-specific by design: the provider-only burn-down widget also defaults to Codex.
     static let title: LocalizedStringResource = "Burn Down Provider"
     static let description = IntentDescription("Select the provider to display.")
 
@@ -88,17 +92,15 @@ struct BurnDownState {
         selection: BurnWindowChoice,
         now: Date = Date())
     {
-        guard let entry = snapshot.entries.first(where: { $0.provider == provider }) else { return nil }
+        guard let entry = snapshot.entries.first(where: { $0.provider == provider.instanceID }) else { return nil }
         self.entry = entry
         self.selection = selection
         self.now = now
     }
 
     var secondaryGloballyCapsPrimary: Bool {
-        switch self.entry.provider {
-        case .codex, .claude: true
-        default: false
-        }
+        guard let provider = self.entry.provider.firstPartyProvider else { return false }
+        return ProviderDescriptorRegistry.descriptor(for: provider).presentation.secondaryGloballyCapsPrimary
     }
 
     var secondaryExhausted: Bool {
@@ -147,6 +149,7 @@ struct BurnDownState {
 }
 
 enum BurnDownRefreshSchedule {
+    private static let minimumInterval: TimeInterval = 5 * 60
     private static let maximumInterval: TimeInterval = 30 * 60
 
     static func nextRefresh(
@@ -155,13 +158,18 @@ enum BurnDownRefreshSchedule {
         now: Date = Date()) -> Date
     {
         let fallback = now.addingTimeInterval(self.maximumInterval)
-        guard let entry = snapshot.entries.first(where: { $0.provider == provider }) else { return fallback }
+        guard let entry = snapshot.entries.first(where: { $0.provider == provider.instanceID }) else { return fallback }
         let nextReset = [entry.primary?.resetsAt, entry.secondary?.resetsAt]
             .compactMap(\.self)
             .filter { $0 > now }
             .min()?
             .addingTimeInterval(1)
-        return min(fallback, nextReset ?? fallback)
+        if let nextReset {
+            let target = min(fallback, nextReset)
+            let minimumDate = now.addingTimeInterval(self.minimumInterval)
+            return max(minimumDate, target)
+        }
+        return fallback
     }
 }
 

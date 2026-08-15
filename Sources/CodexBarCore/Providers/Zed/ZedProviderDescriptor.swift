@@ -18,14 +18,25 @@ public enum ZedProviderDescriptor {
                 toggleTitle: "Show Zed usage",
                 cliName: "zed",
                 defaultEnabled: false,
+                widgetSelectable: false,
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
+                sharePlanLabels: [
+                    "zed free": "Zed Free", "zed pro": "Zed Pro", "zed pro trial": "Zed Pro Trial",
+                    "zed student": "Zed Student", "zed business": "Zed Business",
+                ],
                 dashboardURL: nil,
                 statusPageURL: nil),
             branding: ProviderBranding(
-                iconStyle: .zed,
+                iconStyle: .init(provider: .zed),
                 iconResourceName: "ProviderIcon-zed",
-                color: ProviderColor(red: 8 / 255, green: 78 / 255, blue: 255 / 255)),
+                color: ProviderColor(red: 8 / 255, green: 78 / 255, blue: 255 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x084CCF),
+                    ProviderColor(hex: 0x000000),
+                    ProviderColor(hex: 0xFFFFFF),
+                ],
+                widgetColor: ProviderColor(red: 64 / 255, green: 156 / 255, blue: 255 / 255)),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Zed cost summary is not supported." }),

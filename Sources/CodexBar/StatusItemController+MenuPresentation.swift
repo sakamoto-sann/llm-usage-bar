@@ -5,12 +5,28 @@ import SwiftUI
 
 extension StatusItemController {
     func switcherWeeklyRemaining(for provider: UsageProvider) -> Double? {
-        let snapshot = self.store.snapshot(for: provider)
-        return Self.switcherWeeklyMetricPercent(
+        // The switcher mini-bars mirror the menu-bar indicator, so route through the
+        // same presentation snapshot (claude-swap active-account override, issue #2731).
+        let snapshot = self.store.menuBarSnapshot(for: provider.instanceID)
+        if let metric = Self.switcherWeeklyMetricPercent(
             for: provider,
             snapshot: snapshot,
             showUsed: self.settings.usageBarsShowUsed,
             preference: self.settings.menuBarMetricPreference(for: provider, snapshot: snapshot))
+        {
+            return metric
+        }
+
+        // Business accounts can expose only a monthly credit limit. Keep the existing
+        // rate-limit lanes preferred, then use the projected monthly lane for the switcher bar.
+        // Provider-specific by design: Codex Business accounts report an included monthly credit limit without
+        // rate-limit windows, so only the Codex switcher tab needs this credit fallback.
+        guard provider == .codex else { return nil }
+        let projection = self.store.codexConsumerProjection(
+            surface: .menuBar,
+            snapshotOverride: snapshot)
+        guard let monthly = projection.sourceRateWindow(for: .monthly) else { return nil }
+        return self.settings.usageBarsShowUsed ? monthly.usedPercent : monthly.remainingPercent
     }
 
     func applySubtitle(_ subtitle: String, to item: NSMenuItem, title: String) {
@@ -129,49 +145,112 @@ final class MenuHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
+/// Row payload remembered by erased hosting views so tab switches can exchange
+/// SwiftUI content between an attached and a cached hosting view without ever
+/// detaching `item.view`. Detaching mid-tracking makes Tahoe's NSMenu paint the
+/// row's fallback title ("NSMenuItem") for a few frames — the tab-switch flash.
 @MainActor
-final class MenuCardItemHostingView<Content: View>: NSHostingView<Content>, MenuCardHighlighting, MenuCardMeasuring {
+struct MenuCardRowPayload {
+    let content: AnyView
+    let showsSubmenuIndicator: Bool
+    let submenuIndicatorAlignment: Alignment
+    let submenuIndicatorTopPadding: CGFloat
+    let allowsMenuHighlight: Bool
+    let containsInteractiveControls: Bool
+    let usesGPUSelection: Bool
+    let onClick: (() -> Void)?
+}
+
+/// Inner SwiftUI host used by every card row. The outer container owns AppKit event handling and,
+/// for Overview rows, the composited selection layer.
+private final class MenuRowContentHostingView: NSHostingView<MenuCardSectionContainerView<AnyView>> {
+    override var allowsVibrancy: Bool {
+        true
+    }
+}
+
+/// One stable AppKit class for every menu-card row. Keeping the outer view attached while payloads
+/// move between Overview and provider rows prevents Tahoe from painting NSMenuItem's fallback title.
+@MainActor
+final class MenuRowContainerView: NSView, MenuCardHighlighting, MenuCardMeasuring {
     let highlightState: MenuCardHighlightState
+    let interactiveRegionStore: MenuCardInteractiveRegionStore
+    private let hosting: MenuRowContentHostingView
+    private var selectionView: NSVisualEffectView?
+    private var tintFilter: CIFilter?
     private(set) var allowsMenuHighlight: Bool
     private var onClick: (() -> Void)?
-    private var hasClickRecognizer = false
+    private var containsInteractiveControls: Bool
+    private var isRowHighlighted = false
+    private var isPressed = false
+    private var isForwardingHostedControlPress = false
+    private(set) var rowPayload: MenuCardRowPayload
+    #if DEBUG
+    private var testForwardedHostedControlMouseDown = false
+    private var testForwardedHostedControlMouseUp = false
+    #endif
+
+    private static let selectionHorizontalInset: CGFloat = 6
+    private static let selectionVerticalInset: CGFloat = 2
+    private static let selectionCornerRadius: CGFloat = 6
+    private static let selectionFadeDuration: CFTimeInterval = 0.06
 
     override var allowsVibrancy: Bool {
         true
     }
 
     override var intrinsicContentSize: NSSize {
-        let size = super.intrinsicContentSize
-        guard self.frame.width > 0 else { return size }
-        return NSSize(width: self.frame.width, height: size.height)
+        let width = self.frame.width > 0 ? self.frame.width : NSView.noIntrinsicMetric
+        return NSSize(width: width, height: self.hosting.intrinsicContentSize.height)
     }
 
     init(
-        rootView: Content,
-        highlightState: MenuCardHighlightState,
-        allowsMenuHighlight: Bool,
-        onClick: (() -> Void)? = nil)
+        payload: MenuCardRowPayload,
+        refreshMonitor: MenuCardRefreshMonitor?)
     {
+        let highlightState = MenuCardHighlightState()
+        let interactiveRegionStore = MenuCardInteractiveRegionStore()
         self.highlightState = highlightState
-        self.allowsMenuHighlight = allowsMenuHighlight
-        self.onClick = onClick
-        super.init(rootView: rootView)
-        if onClick != nil {
-            self.installClickRecognizer()
-        }
+        self.interactiveRegionStore = interactiveRegionStore
+        self.rowPayload = payload
+        self.allowsMenuHighlight = payload.allowsMenuHighlight
+        self.containsInteractiveControls = payload.containsInteractiveControls
+        self.onClick = payload.onClick
+        self.hosting = MenuRowContentHostingView(rootView: Self.makeRootView(
+            payload: payload,
+            highlightState: highlightState,
+            refreshMonitor: refreshMonitor,
+            interactiveRegionStore: interactiveRegionStore))
+        super.init(frame: .zero)
+        self.wantsLayer = true
+        self.hosting.wantsLayer = true
+        self.hosting.autoresizingMask = [.width, .height]
+        self.addSubview(self.hosting)
+        self.configureSelectionMode(animated: false)
     }
 
-    /// Reuses this hosting view for a rebuilt card with the same identity: the replaced
-    /// `rootView` is diffed in place by SwiftUI instead of tearing down and recreating the
-    /// hosting view and its graph. Callers must construct `rootView` around this view's own
-    /// `highlightState` so menu hover highlighting keeps driving the rendered content.
-    func prepareForReuse(rootView: Content, allowsMenuHighlight: Bool, onClick: (() -> Void)?) {
-        self.rootView = rootView
-        self.allowsMenuHighlight = allowsMenuHighlight
-        self.onClick = onClick
-        if onClick != nil, !self.hasClickRecognizer {
-            self.installClickRecognizer()
-        }
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Rebuilds the erased SwiftUI root around this container's own state and interaction store.
+    /// The outer NSView never detaches, even when switching between GPU and SwiftUI highlight modes.
+    func replant(_ payload: MenuCardRowPayload, refreshMonitor: MenuCardRefreshMonitor?) {
+        self.rowPayload = payload
+        self.allowsMenuHighlight = payload.allowsMenuHighlight
+        self.containsInteractiveControls = payload.containsInteractiveControls
+        self.onClick = payload.onClick
+        self.isPressed = false
+        self.isForwardingHostedControlPress = false
+        self.highlightState.isHighlighted = !payload.usesGPUSelection && self.isRowHighlighted
+        self.hosting.rootView = Self.makeRootView(
+            payload: payload,
+            highlightState: self.highlightState,
+            refreshMonitor: refreshMonitor,
+            interactiveRegionStore: self.interactiveRegionStore)
+        self.configureSelectionMode(animated: false)
+        self.invalidateIntrinsicContentSize()
     }
 
     /// `NSMenu` tracking consumes keyboard events before they reach a menu item's custom view, so
@@ -190,45 +269,262 @@ final class MenuCardItemHostingView<Content: View>: NSHostingView<Content>, Menu
         return true
     }
 
-    private func installClickRecognizer() {
-        let recognizer = NSClickGestureRecognizer(target: self, action: #selector(self.handlePrimaryClick(_:)))
-        recognizer.buttonMask = 0x1
-        self.addGestureRecognizer(recognizer)
-        self.hasClickRecognizer = true
-    }
-
-    required init(rootView: Content) {
-        self.highlightState = MenuCardHighlightState()
-        self.allowsMenuHighlight = false
-        self.onClick = nil
-        super.init(rootView: rootView)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+    override func acceptsFirstMouse(for _: NSEvent?) -> Bool {
         true
     }
 
-    @objc private func handlePrimaryClick(_ recognizer: NSClickGestureRecognizer) {
-        guard recognizer.state == .ended else { return }
-        self.onClick?()
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        self.refreshTintFilter()
+    }
+
+    override func layout() {
+        super.layout()
+        self.hosting.frame = self.bounds
+        self.selectionView?.frame = self.bounds.insetBy(
+            dx: Self.selectionHorizontalInset,
+            dy: Self.selectionVerticalInset)
+        self.selectionView?.layer?.cornerRadius = Self.selectionCornerRadius
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let descendant = super.hitTest(point)
+        if let descendant {
+            var current: NSView? = descendant
+            while let view = current, view !== self {
+                if view is NSButton || view is NSControl {
+                    return descendant
+                }
+                current = view.superview
+            }
+            if self.hitsHostedInteractiveControl(at: point) {
+                return descendant
+            }
+            if descendant !== self, self.onClick != nil {
+                return self
+            }
+        }
+        return descendant
+    }
+
+    private func locationInView(for event: NSEvent) -> NSPoint {
+        guard self.window != nil else {
+            return event.locationInWindow
+        }
+        return self.convert(event.locationInWindow, from: nil)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.type == .leftMouseDown, self.onClick != nil else {
+            super.mouseDown(with: event)
+            return
+        }
+        let localPoint = self.locationInView(for: event)
+        if self.beginPrimaryPress(at: localPoint) {
+            #if DEBUG
+            self.testForwardedHostedControlMouseDown = true
+            #endif
+            super.mouseDown(with: event)
+            return
+        }
+        guard self.rowPayload.usesGPUSelection else { return }
+        guard self.bounds.contains(localPoint), let window = self.window else {
+            self.isPressed = false
+            return
+        }
+
+        // A submenu-backed NSMenuItem consumes mouseUp in its nested tracking loop before a custom
+        // view receives it. Track the drag/up sequence directly in GPU mode so release-inside
+        // cancellation remains native and the row action runs before the menu can close.
+        var shouldInvoke = false
+        window.trackEvents(
+            matching: [.leftMouseDragged, .leftMouseUp],
+            timeout: NSEvent.foreverDuration,
+            mode: .eventTracking)
+        { [weak self] trackedEvent, stop in
+            guard let self, let trackedEvent else {
+                stop.pointee = true
+                return
+            }
+            if self.primaryPressShouldYieldToMenu(for: trackedEvent) {
+                window.postEvent(trackedEvent, atStart: true)
+                stop.pointee = true
+                return
+            }
+            guard let decision = self.primaryPressDecision(for: trackedEvent) else { return }
+            shouldInvoke = decision
+            stop.pointee = true
+        }
+        self.isPressed = false
+        if shouldInvoke {
+            self.onClick?()
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard event.type == .leftMouseUp, self.onClick != nil else {
+            super.mouseUp(with: event)
+            return
+        }
+        let result = self.endPrimaryPress(at: self.locationInView(for: event))
+        if result.forwardToHostedControl {
+            #if DEBUG
+            self.testForwardedHostedControlMouseUp = true
+            #endif
+            super.mouseUp(with: event)
+            return
+        }
+        if result.invokeRowAction {
+            self.onClick?()
+        }
+    }
+
+    /// Returns whether AppKit should forward the press into a nested SwiftUI control.
+    private func beginPrimaryPress(at point: NSPoint) -> Bool {
+        if self.hitsHostedInteractiveControl(at: point) {
+            self.isForwardingHostedControlPress = true
+            return true
+        }
+        self.isPressed = self.bounds.contains(point)
+        return false
+    }
+
+    private func endPrimaryPress(at point: NSPoint) -> (forwardToHostedControl: Bool, invokeRowAction: Bool) {
+        if self.isForwardingHostedControlPress {
+            self.isForwardingHostedControlPress = false
+            return (true, false)
+        }
+        defer { self.isPressed = false }
+        return (false, self.isPressed && self.bounds.contains(point))
+    }
+
+    private func hitsHostedInteractiveControl(at point: NSPoint) -> Bool {
+        guard self.containsInteractiveControls else { return false }
+        let hostedPoint = self.hosting.convert(point, from: self)
+        return self.interactiveRegionStore.contains(
+            hostedPoint,
+            hostingBounds: self.hosting.bounds,
+            fittedSize: self.hosting.fittingSize)
     }
 
     func measuredHeight(width: CGFloat) -> CGFloat {
-        self.frame = NSRect(origin: self.frame.origin, size: NSSize(width: width, height: 1))
-        self.layoutSubtreeIfNeeded()
-        return self.fittingSize.height
+        self.hosting.frame = NSRect(origin: self.hosting.frame.origin, size: NSSize(width: width, height: 1))
+        self.hosting.layoutSubtreeIfNeeded()
+        return self.hosting.fittingSize.height
     }
 
     func setHighlighted(_ highlighted: Bool) {
-        guard self.highlightState.isHighlighted != highlighted else { return }
-        self.highlightState.isHighlighted = highlighted
+        guard self.isRowHighlighted != highlighted else { return }
+        self.isRowHighlighted = highlighted
+        self.applyHighlight(animated: true)
+    }
+
+    private func configureSelectionMode(animated: Bool) {
+        if self.rowPayload.usesGPUSelection {
+            _ = self.ensureSelectionView()
+            self.refreshTintFilter()
+        } else {
+            self.hosting.layer?.filters = []
+            self.selectionView?.removeFromSuperview()
+            self.selectionView = nil
+            self.tintFilter = nil
+        }
+        self.applyHighlight(animated: animated)
+        self.needsLayout = true
+    }
+
+    private func applyHighlight(animated: Bool) {
+        guard self.rowPayload.usesGPUSelection else {
+            self.highlightState.isHighlighted = self.isRowHighlighted
+            return
+        }
+
+        self.highlightState.isHighlighted = false
+        self.hosting.layer?.filters = self.isRowHighlighted ? self.tintFilter.map { [$0] } ?? [] : []
+        let layer = self.ensureSelectionView().layer
+        let targetOpacity: Float = self.isRowHighlighted ? 1 : 0
+        if animated {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = layer?.presentation()?.opacity ?? (self.isRowHighlighted ? 0 : 1)
+            fade.toValue = targetOpacity
+            fade.duration = Self.selectionFadeDuration
+            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer?.add(fade, forKey: "selectionFade")
+        }
+        layer?.opacity = targetOpacity
+    }
+
+    private func ensureSelectionView() -> NSVisualEffectView {
+        if let selectionView {
+            return selectionView
+        }
+        let selectionView = NSVisualEffectView()
+        selectionView.material = .selection
+        selectionView.blendingMode = .withinWindow
+        selectionView.state = .active
+        selectionView.isEmphasized = true
+        selectionView.wantsLayer = true
+        selectionView.layer?.masksToBounds = true
+        selectionView.layer?.opacity = 0
+        selectionView.autoresizingMask = [.width, .height]
+        self.addSubview(selectionView, positioned: .below, relativeTo: self.hosting)
+        self.selectionView = selectionView
+        return selectionView
+    }
+
+    private func refreshTintFilter() {
+        guard self.rowPayload.usesGPUSelection else { return }
+        self.tintFilter = Self.makeSelectedTextTintFilter(appearance: self.effectiveAppearance)
+        if self.isRowHighlighted {
+            self.hosting.layer?.filters = self.tintFilter.map { [$0] } ?? []
+        }
+    }
+
+    private static func makeSelectedTextTintFilter(appearance: NSAppearance) -> CIFilter? {
+        guard let filter = CIFilter(name: "CIColorMatrix") else { return nil }
+        var tint: NSColor = .white
+        appearance.performAsCurrentDrawingAppearance {
+            tint = NSColor.selectedMenuItemTextColor.usingColorSpace(.deviceRGB) ?? .white
+        }
+        filter.setValue(CIVector(x: 0, y: 0, z: 0, w: 0), forKey: "inputRVector")
+        filter.setValue(CIVector(x: 0, y: 0, z: 0, w: 0), forKey: "inputGVector")
+        filter.setValue(CIVector(x: 0, y: 0, z: 0, w: 0), forKey: "inputBVector")
+        filter.setValue(CIVector(x: 0, y: 0, z: 0, w: 1), forKey: "inputAVector")
+        filter.setValue(
+            CIVector(x: tint.redComponent, y: tint.greenComponent, z: tint.blueComponent, w: 0),
+            forKey: "inputBiasVector")
+        return filter
+    }
+
+    private static func makeRootView(
+        payload: MenuCardRowPayload,
+        highlightState: MenuCardHighlightState,
+        refreshMonitor: MenuCardRefreshMonitor?,
+        interactiveRegionStore: MenuCardInteractiveRegionStore) -> MenuCardSectionContainerView<AnyView>
+    {
+        MenuCardSectionContainerView(
+            highlightState: highlightState,
+            showsSubmenuIndicator: payload.showsSubmenuIndicator,
+            submenuIndicatorAlignment: payload.submenuIndicatorAlignment,
+            submenuIndicatorTopPadding: payload.submenuIndicatorTopPadding,
+            refreshMonitor: refreshMonitor,
+            interactiveRegionStore: interactiveRegionStore)
+        {
+            payload.content
+        }
+    }
+
+    private func primaryPressDecision(for event: NSEvent) -> Bool? {
+        guard event.type == .leftMouseUp else { return nil }
+        return self.bounds.contains(self.locationInView(for: event))
+    }
+
+    private func primaryPressShouldYieldToMenu(for event: NSEvent) -> Bool {
+        event.type == .leftMouseDragged && !self.bounds.contains(self.locationInView(for: event))
     }
 }
+
+typealias ErasedMenuCardHostingView = MenuRowContainerView
 
 @MainActor
 final class PersistentRefreshMenuView: NSView, MenuCardHighlighting {
@@ -475,18 +771,95 @@ final class PersistentRefreshMenuView: NSView, MenuCardHighlighting {
     }
 }
 
+#if DEBUG
+extension MenuRowContainerView {
+    var _test_forwardedHostedControlEvents: (mouseDown: Bool, mouseUp: Bool) {
+        (self.testForwardedHostedControlMouseDown, self.testForwardedHostedControlMouseUp)
+    }
+
+    func _test_hitsHostedInteractiveControl(at point: NSPoint) -> Bool {
+        self.hitsHostedInteractiveControl(at: point)
+    }
+
+    func _test_simulateRuntimeClick(at point: NSPoint? = nil) -> Bool {
+        let clickPoint = point ?? NSPoint(x: self.bounds.midX, y: self.bounds.midY)
+        guard let onClick = self.onClick else { return false }
+        if self.rowPayload.usesGPUSelection {
+            guard self.hitTest(clickPoint) === self, self.bounds.contains(clickPoint) else { return false }
+            onClick()
+            return true
+        }
+        guard !self.beginPrimaryPress(at: clickPoint) else {
+            _ = self.endPrimaryPress(at: clickPoint)
+            return false
+        }
+        let result = self.endPrimaryPress(at: clickPoint)
+        guard result.invokeRowAction else { return false }
+        onClick()
+        return true
+    }
+
+    func _test_primaryPressDecision(for event: NSEvent) -> Bool? {
+        self.primaryPressDecision(for: event)
+    }
+
+    func _test_primaryPressShouldYieldToMenu(for event: NSEvent) -> Bool {
+        self.primaryPressShouldYieldToMenu(for: event)
+    }
+
+    var isHighlightedForTesting: Bool {
+        self.isRowHighlighted
+    }
+
+    var swiftUIHighlightStateIsHighlightedForTesting: Bool {
+        self.highlightState.isHighlighted
+    }
+
+    var usesGPUSelectionForTesting: Bool {
+        self.rowPayload.usesGPUSelection
+    }
+
+    var hasGPUSelectionLayerForTesting: Bool {
+        self.selectionView != nil
+    }
+}
+#endif
+
 struct MenuCardSectionContainerView<Content: View>: View {
     @Bindable var highlightState: MenuCardHighlightState
     let showsSubmenuIndicator: Bool
     let submenuIndicatorAlignment: Alignment
     let submenuIndicatorTopPadding: CGFloat
     var refreshMonitor: MenuCardRefreshMonitor?
+    var interactiveRegionStore: MenuCardInteractiveRegionStore?
     @ViewBuilder let content: () -> Content
+
+    init(
+        highlightState: MenuCardHighlightState,
+        showsSubmenuIndicator: Bool,
+        submenuIndicatorAlignment: Alignment,
+        submenuIndicatorTopPadding: CGFloat,
+        refreshMonitor: MenuCardRefreshMonitor?,
+        interactiveRegionStore: MenuCardInteractiveRegionStore? = nil,
+        @ViewBuilder content: @escaping () -> Content)
+    {
+        self.highlightState = highlightState
+        self.showsSubmenuIndicator = showsSubmenuIndicator
+        self.submenuIndicatorAlignment = submenuIndicatorAlignment
+        self.submenuIndicatorTopPadding = submenuIndicatorTopPadding
+        self.refreshMonitor = refreshMonitor
+        self.interactiveRegionStore = interactiveRegionStore
+        self.content = content
+    }
 
     var body: some View {
         self.content()
             .environment(\.menuItemHighlighted, self.highlightState.isHighlighted)
             .environment(\.menuCardRefreshMonitor, self.refreshMonitor)
+            .coordinateSpace(name: MenuCardInteractiveRegionPreferenceKey.coordinateSpaceName)
+            .onPreferenceChange(MenuCardInteractiveRegionPreferenceKey.self) { regions in
+                self.interactiveRegionStore?.regions = regions
+            }
             .foregroundStyle(MenuHighlightStyle.primary(self.highlightState.isHighlighted))
             .background(alignment: .topLeading) {
                 if self.highlightState.isHighlighted {
@@ -505,5 +878,44 @@ struct MenuCardSectionContainerView<Content: View>: View {
                         .padding(.trailing, 10)
                 }
             }
+    }
+}
+
+@MainActor
+@Observable
+final class MenuCardInteractiveRegionStore {
+    var regions: [CGRect] = []
+
+    func contains(_ point: CGPoint, hostingBounds: CGRect, fittedSize: CGSize) -> Bool {
+        // NSHostingView centers intrinsic-height SwiftUI content in the menu item's padded frame.
+        // Preference rectangles use the SwiftUI root's coordinates, so remove that AppKit offset.
+        let contentOrigin = CGPoint(
+            x: max(0, (hostingBounds.width - fittedSize.width) / 2),
+            y: max(0, (hostingBounds.height - fittedSize.height) / 2))
+        let contentPoint = CGPoint(x: point.x - contentOrigin.x, y: point.y - contentOrigin.y)
+        return self.regions.contains { $0.contains(contentPoint) }
+    }
+}
+
+struct MenuCardInteractiveRegionPreferenceKey: PreferenceKey {
+    static let coordinateSpaceName = "MenuCardInteractiveRegion"
+    static let defaultValue: [CGRect] = []
+
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+extension View {
+    func menuCardInteractiveControl(isEnabled: Bool = true) -> some View {
+        self.background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: MenuCardInteractiveRegionPreferenceKey.self,
+                    value: isEnabled
+                        ? [proxy.frame(in: .named(MenuCardInteractiveRegionPreferenceKey.coordinateSpaceName))]
+                        : [])
+            }
+        }
     }
 }

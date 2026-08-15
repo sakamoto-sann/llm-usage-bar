@@ -6,7 +6,33 @@ import QuartzCore
 import Security
 import SwiftUI
 
+enum CodexBarLaunchMode: Equatable {
+    case application
+    case hookEvent
+
+    static func resolve(arguments: [String]) -> Self {
+        // Other CodexBar installations can leave this app path registered in ~/.codex/hooks.json.
+        // Treat those invocations as a no-op before AppKit creates a second set of status items.
+        arguments.dropFirst().contains("--hook-event") ? .hookEvent : .application
+    }
+}
+
 @main
+enum CodexBarEntryPoint {
+    @MainActor
+    static func main() {
+        // Packaging launch smoke check (#2738): force the resource loads that
+        // trapped in 0.48.0 and exit before any AppKit/UI setup.
+        if CodexBarCoreResourceSmoke.isRequested() {
+            exit(CodexBarCoreResourceSmoke.run())
+        }
+        guard CodexBarLaunchMode.resolve(arguments: CommandLine.arguments) == .application else {
+            return
+        }
+        CodexBarApp.main()
+    }
+}
+
 struct CodexBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var settings: SettingsStore
@@ -91,6 +117,7 @@ struct CodexBarApp: App {
             PreferencesView(
                 settings: self.settings,
                 store: self.store,
+                cloudSyncState: self.appDelegate.cloudSyncState,
                 updater: self.appDelegate.updaterController,
                 selection: self.preferencesSelection,
                 managedCodexAccountCoordinator: self.managedCodexAccountCoordinator,
@@ -105,8 +132,18 @@ struct CodexBarApp: App {
 
     private func openSettings(pane: SettingsPane) {
         self.preferencesSelection.pane = pane
+        DockIconController.shared.promote()
         NSApp.activate(ignoringOtherApps: true)
-        _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+        let outcome = SettingsWindowOpener.live().open(preferred: .appKit)
+        let logger = CodexBarLog.logger(LogCategories.app)
+        switch outcome {
+        case .preferred:
+            break
+        case .fallback:
+            logger.warning("Settings AppKit action was not handled; used notification fallback")
+        case .failed:
+            logger.error("Failed to open Settings; AppKit action and notification fallback unavailable")
+        }
     }
 
     private static func applyLanguagePreference(from settings: SettingsStore) {
@@ -203,12 +240,13 @@ final class SparkleUpdaterController: NSObject, UpdaterProviding, SPUUpdaterDele
     }
 
     func checkForUpdates(_ sender: Any?) {
+        DockIconController.shared.promote()
         self.controller.checkForUpdates(sender)
     }
 
     func installUpdate() {
         guard let immediateInstallHandler else {
-            self.controller.checkForUpdates(nil)
+            self.checkForUpdates(nil)
             return
         }
 
@@ -347,8 +385,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     let updaterController: UpdaterProviding = makeUpdaterController()
+    let cloudSyncState = CloudSyncState()
     private let confettiOverlayController = ScreenConfettiOverlayController()
     private let confettiLogger = CodexBarLog.logger(LogCategories.confetti)
+    private let dockIconController = DockIconController.shared
     private lazy var memoryPressureMonitor = MemoryPressureMonitor(trimAppCaches: { [weak self] in
         self?.trimRebuildableCachesForMemoryPressure() ?? MemoryPressureCacheTrimSummary()
     })
@@ -360,6 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var preferencesSelection: PreferencesSelection?
     private var managedCodexAccountCoordinator: ManagedCodexAccountCoordinator?
     private var codexAccountPromotionCoordinator: CodexAccountPromotionCoordinator?
+    private var cloudSyncCoordinator: CloudSyncCoordinator?
     private var hasInstalledLimitResetObservers = false
     #if DEBUG
     private var debugMemoryPressureObserver: NSObjectProtocol?
@@ -375,6 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.preferencesSelection = dependencies.selection
         self.managedCodexAccountCoordinator = dependencies.managedCodexAccountCoordinator
         self.codexAccountPromotionCoordinator = dependencies.codexAccountPromotionCoordinator
+        self.cloudSyncCoordinator = CloudSyncCoordinator(settings: dependencies.settings, state: self.cloudSyncState)
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -382,12 +424,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AppNotifications.shared.requestAuthorizationOnStartup()
+        self.dockIconController.start()
         self.memoryPressureMonitor.start()
         #if DEBUG
         self.installDebugMemoryPressureObserverIfNeeded()
         #endif
         self.ensureStatusController()
+        self.cloudSyncCoordinator?.start()
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let settings = self?.settings else { return }
+            AdaptiveActivityConsentPresenter.presentIfNeeded(settings: settings)
+            AppNotifications.shared.requestAuthorizationOnStartup()
+            // A persisted non-USD choice opts into the daily exchange-rate refresh. The service
+            // returns before networking for the default USD setting and Auto.
+            guard CurrencyExchange.requiresLiveRates(
+                preferredCurrencyCode: settings.preferredCurrencyCode)
+            else { return }
+            await CurrencyExchange.shared.fetchLatestRatesIfNeeded(
+                preferredCurrencyCode: settings.preferredCurrencyCode)
+        }
         KeyboardShortcuts.onKeyUp(for: .openMenu) { [weak self] in
             // KeyboardShortcuts dispatches both normal and menu-tracking hotkeys on the main event loop.
             MainActor.assumeIsolated {
@@ -410,6 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        self.cloudSyncCoordinator?.stop()
         self.memoryPressureMonitor.stop()
         #if DEBUG
         self.removeDebugMemoryPressureObserver()
@@ -418,6 +475,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.confettiOverlayController.dismiss()
         self.dismissAppKitWindowsForShutdown()
         self.terminateActiveProcessesForAppShutdown()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        self.cloudSyncCoordinator?.applicationDidBecomeActive()
     }
 
     func runProviderLoginFlow(_ provider: UsageProvider) async {
@@ -450,6 +511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resetKind: String)
     {
         let origin = self.statusController?.celebrationOriginPoint(for: provider)
+        let palette = ProviderDescriptorRegistry.descriptor(for: provider).branding.confettiPalette
         self.confettiLogger.info(
             "Triggering confetti",
             metadata: [
@@ -458,7 +520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "resetKind": resetKind,
                 "originKnown": origin == nil ? "0" : "1",
             ])
-        self.confettiOverlayController.play(originInScreen: origin)
+        self.confettiOverlayController.play(originInScreen: origin, colors: palette)
     }
 
     /// Use the classic (non-Liquid Glass) app icon on macOS versions before 26.
@@ -494,7 +556,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func ensureStatusController() {
-        if self.statusController != nil { return }
+        if self.statusController != nil {
+            return
+        }
 
         if let store,
            let settings,
@@ -511,6 +575,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 selection,
                 managedCodexAccountCoordinator,
                 codexAccountPromotionCoordinator)
+            if let statusController = self.statusController as? StatusItemController {
+                statusController.cloudSyncState = self.cloudSyncState
+                MenuSwitchFlickerProbe.startIfRequested(controller: statusController)
+            }
             return
         }
 

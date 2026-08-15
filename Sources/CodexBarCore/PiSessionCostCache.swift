@@ -2,7 +2,7 @@ import Foundation
 
 enum PiSessionCostCacheIO {
     /// Artifact schema version. Pricing changes are tracked separately by `pricingKey`.
-    private static let artifactVersion = 5
+    private static let artifactVersion = 8
 
     private static func defaultCacheRoot() -> URL {
         let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -27,11 +27,17 @@ enum PiSessionCostCacheIO {
         return decoded
     }
 
-    static func save(cache: PiSessionCostCache, cacheRoot: URL? = nil) {
+    static func save(
+        cache: PiSessionCostCache,
+        cacheRoot: URL? = nil,
+        calendar: Calendar = .current)
+    {
         let url = self.cacheFileURL(cacheRoot: cacheRoot)
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
+        var cache = cache
+        cache.timeZoneIdentifier = calendar.timeZone.identifier
         let tmp = dir.appendingPathComponent(".tmp-\(UUID().uuidString).json", isDirectory: false)
         let data = (try? JSONEncoder().encode(cache)) ?? Data()
         do {
@@ -52,11 +58,12 @@ struct PiSessionCostCache: Codable {
     var lastScanUnixMs: Int64 = 0
     var scanSinceKey: String?
     var scanUntilKey: String?
+    var timeZoneIdentifier: String?
     var pricingKey: String?
     var daysByProvider: [String: [String: [String: PiPackedUsage]]] = [:]
     var files: [String: PiSessionFileUsage] = [:]
 
-    init(version: Int = 5) {
+    init(version: Int = 8) {
         self.version = version
     }
 }
@@ -65,8 +72,38 @@ struct PiSessionFileUsage: Codable {
     var mtimeUnixMs: Int64
     var size: Int64
     var parsedBytes: Int64
+    var sessionID: String?
     var lastModelContext: PiModelContext?
     var contributions: [String: [String: [String: PiPackedUsage]]]
+    var unkeyedContributions: [String: [String: [String: PiPackedUsage]]]
+    var entryUsages: [String: PiSessionEntryUsage]
+
+    init(
+        mtimeUnixMs: Int64,
+        size: Int64,
+        parsedBytes: Int64,
+        sessionID: String? = nil,
+        lastModelContext: PiModelContext?,
+        contributions: [String: [String: [String: PiPackedUsage]]],
+        unkeyedContributions: [String: [String: [String: PiPackedUsage]]] = [:],
+        entryUsages: [String: PiSessionEntryUsage] = [:])
+    {
+        self.mtimeUnixMs = mtimeUnixMs
+        self.size = size
+        self.parsedBytes = parsedBytes
+        self.sessionID = sessionID
+        self.lastModelContext = lastModelContext
+        self.contributions = contributions
+        self.unkeyedContributions = unkeyedContributions
+        self.entryUsages = entryUsages
+    }
+}
+
+struct PiSessionEntryUsage: Codable, Equatable {
+    var providerRawValue: String
+    var dayKey: String
+    var modelName: String
+    var usage: PiPackedUsage
 }
 
 struct PiModelContext: Codable, Equatable {
