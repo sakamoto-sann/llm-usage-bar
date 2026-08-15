@@ -1138,6 +1138,7 @@
 "%dd" = "%d d";
 "(%d%% risk)" = "(%d%% de riesgo de agotamiento)";
 "About CodexBar" = "Acerca de CodexBar";
+"About LLM Usage Bar" = "Acerca de LLM Usage Bar";
 "Add Account..." = "Añadir cuenta...";
 "Add accounts via GitHub OAuth Device Flow on the selected host." = "Añade cuentas mediante el flujo de dispositivo OAuth de GitHub en el host seleccionado.";
 "Add Google Account" = "Añadir cuenta de Google";
