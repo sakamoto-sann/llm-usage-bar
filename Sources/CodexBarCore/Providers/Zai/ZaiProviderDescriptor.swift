@@ -226,10 +226,8 @@ private struct ZcodePlanFetchStrategy: ProviderFetchStrategy {
     }
 
     static func configURL(environment: [String: String]) -> URL? {
-        let home = URL(
-            fileURLWithPath: environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path,
-            isDirectory: true
-        )
+        let homePath = environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let home = URL(fileURLWithPath: homePath, isDirectory: true)
         return home.appendingPathComponent(".zcode/v2/config.json", isDirectory: false)
     }
 }

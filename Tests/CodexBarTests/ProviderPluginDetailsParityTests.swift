@@ -35,9 +35,8 @@ struct ProviderPluginDetailsParityTests {
         ]
         // Pin HOME to an empty directory so the China-region file alias and the ZCode
         // config lookup are deterministic regardless of the host's real home directory.
-        let emptyHome = URL(
-            fileURLWithPath: "/tmp/llm-usage-bar-parity-home-\(ProcessInfo.processInfo.processIdentifier)"
-        )
+        let homePath = "/tmp/llm-usage-bar-parity-home-\(ProcessInfo.processInfo.processIdentifier)"
+        let emptyHome = URL(fileURLWithPath: homePath)
         try? FileManager.default.createDirectory(at: emptyHome, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: emptyHome) }
         environment["HOME"] = emptyHome.path

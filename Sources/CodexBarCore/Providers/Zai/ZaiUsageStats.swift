@@ -210,8 +210,8 @@ extension ZaiUsageSnapshot {
             return label
         }
         if limit.type == .timeLimit {
-        }
             return "Monthly"
+        }
         return nil
     }
 }
@@ -519,7 +519,6 @@ public struct ZaiModelDataItem: Sendable {
         self.tokensUsage = tokensUsage
     }
 }
-
 
 /// Errors that can occur during z.ai usage fetching
 public enum ZaiUsageError: LocalizedError, Sendable {
