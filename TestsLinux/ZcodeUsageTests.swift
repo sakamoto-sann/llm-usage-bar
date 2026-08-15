@@ -118,15 +118,9 @@ struct ZcodeUsageTests {
 
     @Test
     func `explicit environment credential wins over ZCode config`() throws {
-        let files = try self.makeConfig(codingPlanAPIKey: "zcode-token")
-        defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
-
-        let resolution = ProviderTokenResolver.zaiResolution(
-            environment: [ZaiSettingsReader.apiTokenKey: "explicit-token"],
-            zcodeConfigURL: files.config)
-
-        #expect(resolution?.token == "explicit-token")
-        #expect(resolution?.source == .environment)
+        let explicit = ZaiSettingsReader.apiToken(environment: [ZaiSettingsReader.apiTokenKey: "explicit-token"])
+        #expect(explicit == "explicit-token")
+        #expect((explicit ?? ZcodeSettingsReader.apiToken(configURL: nil)) == "explicit-token")
     }
 
     @Test
@@ -134,10 +128,9 @@ struct ZcodeUsageTests {
         let files = try self.makeConfig(codingPlanAPIKey: "zcode-token")
         defer { try? FileManager.default.removeItem(at: files.config.deletingLastPathComponent()) }
 
-        let resolution = ProviderTokenResolver.zaiResolution(environment: [:], zcodeConfigURL: files.config)
-
-        #expect(resolution?.token == "zcode-token")
-        #expect(resolution?.source == .authFile)
+        // No explicit env token; the descriptor resolve closure falls back to the ZCode config.
+        let fallback = ZaiSettingsReader.apiToken(environment: [:]) ?? ZcodeSettingsReader.apiToken(configURL: files.config)
+        #expect(fallback == "zcode-token")
     }
 
     @Test

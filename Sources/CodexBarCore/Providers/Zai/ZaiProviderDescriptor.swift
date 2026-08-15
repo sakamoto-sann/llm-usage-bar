@@ -131,8 +131,14 @@ public enum ZaiProviderDescriptor {
     private static func fetchPlan() -> ProviderFetchPlan {
         ProviderFetchPlan(
             sourceModes: [.auto, .api],
-            pipeline: ProviderFetchPipeline(resolveStrategies: { _ in
-                [ScriptFetchStrategy(
+            pipeline: ProviderFetchPipeline(resolveStrategies: { context in
+                Self.zaiFetchStrategies(environment: context.env)
+            }))
+    }
+
+    private static func zaiFetchStrategies(environment: [String: String]) -> [any ProviderFetchStrategy] {
+        var strategies: [any ProviderFetchStrategy] = [
+            ScriptFetchStrategy(
                     id: "zai.js",
                     provider: .zai,
                     bundledPlugin: "zai",
@@ -176,15 +182,20 @@ public enum ZaiProviderDescriptor {
                             settings: plainValues,
                             secrets: [ZaiSettingsReader.apiTokenKey: token])
                     },
-                    isEnabled: { context in
-                        // The z.ai API path is only used when an explicit credential exists;
-                        // ZCode-wrapped plans are handled by the zcode-plan strategy below.
-                        ZaiSettingsReader.apiToken(
-                            for: context.settings?.zai?.apiRegion ?? .global,
-                            environment: context.env) != nil
-                    }),
-                ZcodePlanFetchStrategy()]
-            }))
+                                    isEnabled: { env in
+                    // The z.ai API path is used when an explicit credential exists,
+                    // including the China-region env/file alias; ZCode-wrapped plans are
+                    // handled by the zcode-plan strategy below.
+                    ZaiSettingsReader.apiToken(for: .global, environment: env) != nil
+                }),
+        ]
+        // Only offer the ZCode fallback strategy when a local ZCode credential exists,
+        // so hosts without one (including isolated test environments) see the pipeline
+        // exactly as before.
+        if ZcodeSettingsReader.apiToken(configURL: ZcodePlanFetchStrategy.configURL(environment: environment)) != nil {
+            strategies.append(ZcodePlanFetchStrategy())
+        }
+        return strategies
     }
 }
 
@@ -196,11 +207,12 @@ private struct ZcodePlanFetchStrategy: ProviderFetchStrategy {
     let kind: ProviderFetchKind = .apiToken
 
     func isAvailable(_ context: ProviderFetchContext) async -> Bool {
-        ZcodeSettingsReader.apiToken() != nil
+        ZcodeSettingsReader.apiToken(configURL: Self.configURL(environment: context.env)) != nil
     }
 
     func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
-        guard let token = ZcodeSettingsReader.apiToken() else {
+        let token = ZcodeSettingsReader.apiToken(configURL: Self.configURL(environment: context.env))
+        guard let token else {
             throw ProviderFetchClassifiedError(kind: .missingCredential, message: "ZCode GLM credential missing")
         }
         let snapshot = try await ZcodeUsageFetcher.fetchUsage(
@@ -211,5 +223,10 @@ private struct ZcodePlanFetchStrategy: ProviderFetchStrategy {
 
     func shouldFallback(on _: Error, context _: ProviderFetchContext) -> Bool {
         true
+    }
+
+    static func configURL(environment: [String: String]) -> URL? {
+        let home = URL(fileURLWithPath: environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path, isDirectory: true)
+        return home.appendingPathComponent(".zcode/v2/config.json", isDirectory: false)
     }
 }

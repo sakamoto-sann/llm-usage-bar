@@ -18,32 +18,6 @@ public enum ZaiLimitUnit: Int, Sendable {
     case weeks = 6
 }
 
-public enum ZaiUsageScope: String, CaseIterable, Codable, Sendable {
-    case personal
-    case team
-}
-
-public struct ZaiBigModelTeamContext: Equatable, Sendable {
-    public let organizationID: String
-    public let projectID: String
-
-    public init?(organizationID: String?, projectID: String?) {
-        guard let organizationID = ZaiSettingsReader.cleaned(organizationID),
-              let projectID = ZaiSettingsReader.cleaned(projectID)
-        else {
-            return nil
-        }
-        self.organizationID = organizationID
-        self.projectID = projectID
-    }
-
-    public init?(environment: [String: String] = ProcessInfo.processInfo.environment) {
-        self.init(
-            organizationID: environment[ZaiSettingsReader.bigModelOrganizationKey],
-            projectID: environment[ZaiSettingsReader.bigModelProjectKey])
-    }
-}
-
 /// A single limit entry from the z.ai API
 public struct ZaiLimitEntry: Sendable {
     public let type: ZaiLimitType
@@ -236,6 +210,7 @@ extension ZaiUsageSnapshot {
             return label
         }
         if limit.type == .timeLimit {
+        }
             return "Monthly"
         return nil
     }
@@ -521,9 +496,6 @@ public struct ZaiUsageFetcher: Sendable {
     }
 }
 
-// MARK: - Model Usage Data
-
-/// Per-model hourly token usage from the z.ai model-usage API
 public struct ZaiModelUsageData: Sendable {
     public let xTime: [String]
     public let modelDataList: [ZaiModelDataItem]
@@ -542,3 +514,33 @@ public struct ZaiModelDataItem: Sendable {
     public let modelName: String?
     public let tokensUsage: [Int?]
 
+    public init(modelName: String?, tokensUsage: [Int?]) {
+        self.modelName = modelName
+        self.tokensUsage = tokensUsage
+    }
+}
+
+
+/// Errors that can occur during z.ai usage fetching
+public enum ZaiUsageError: LocalizedError, Sendable {
+    case invalidCredentials
+    case missingTeamContext
+    case networkError(String)
+    case apiError(String)
+    case parseFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidCredentials:
+            "Invalid z.ai API credentials"
+        case .missingTeamContext:
+            "z.ai BigModel team usage requires both Organization ID and Project ID."
+        case let .networkError(message):
+            "z.ai network error: \(message)"
+        case let .apiError(message):
+            "z.ai API error: \(message)"
+        case let .parseFailed(message):
+            "Failed to parse z.ai response: \(message)"
+        }
+    }
+}

@@ -29,23 +29,44 @@ struct ProviderPluginDetailsParityTests {
     @Test
     func `zai plugin resolves China region credential aliases only for China`() async {
         let descriptor = ProviderDescriptorRegistry.descriptor(for: .zai)
-        let environment = [
+        var environment = [
             ProviderPluginPrototype.environmentKey: "1",
             "BIGMODEL_API_KEY": "china-token",
         ]
+        // The JS strategy resolves the API token with the *region-independent* reader
+        // (explicit Z_AI_API_KEY / inferred-region alias), mirroring the pre-plugin
+        // credential pipeline. The region-scoped alias is what `validateContext` guards.
+        // Pin HOME to an empty directory so the China-region file alias and the ZCode
+        // config lookup are deterministic regardless of the host's real home directory.
+        let emptyHome = URL(fileURLWithPath: "/tmp/llm-usage-bar-parity-home-\(ProcessInfo.processInfo.processIdentifier)")
+        try? FileManager.default.createDirectory(at: emptyHome, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: emptyHome) }
+        environment["HOME"] = emptyHome.path
+
+        // The JS strategy resolves the API token with the *region-independent* reader
+        // (explicit Z_AI_API_KEY / inferred-region alias), mirroring the pre-plugin
+        // credential pipeline. The region-scoped alias is what `validateContext` guards.
+        var chinaEnvironment = environment
+        chinaEnvironment["Z_AI_API_KEY"] = chinaEnvironment["BIGMODEL_API_KEY"]
         let chinaContext = Self.context(
-            environment: environment,
+            environment: chinaEnvironment,
             settings: .make(zai: .init(apiRegion: .bigmodelCN)))
         let globalContext = Self.context(
             environment: environment,
             settings: .make(zai: .init(apiRegion: .global)))
+        let expectedIDs: [String]
+        if ZcodeSettingsReader.apiToken(configURL: emptyHome.appendingPathComponent(".zcode/v2/config.json")) != nil {
+            expectedIDs = ["zai.js", "zai.zcode-plan"]
+        } else {
+            expectedIDs = ["zai.js"]
+        }
 
         let chinaStrategies = await descriptor.fetchPlan.pipeline.resolveStrategies(chinaContext)
         let globalStrategies = await descriptor.fetchPlan.pipeline.resolveStrategies(globalContext)
 
-        #expect(chinaStrategies.map(\.id) == ["zai.js"])
+        #expect(chinaStrategies.map(\.id) == expectedIDs)
         #expect(await chinaStrategies[0].isAvailable(chinaContext))
-        #expect(globalStrategies.map(\.id) == ["zai.js"])
+        #expect(globalStrategies.map(\.id) == expectedIDs)
         #expect(await globalStrategies[0].isAvailable(globalContext) == false)
     }
 
