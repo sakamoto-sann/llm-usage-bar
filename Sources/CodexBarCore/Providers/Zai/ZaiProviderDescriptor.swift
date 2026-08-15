@@ -139,50 +139,50 @@ public enum ZaiProviderDescriptor {
     private static func zaiFetchStrategies(environment: [String: String]) -> [any ProviderFetchStrategy] {
         var strategies: [any ProviderFetchStrategy] = [
             ScriptFetchStrategy(
-                    id: "zai.js",
-                    provider: .zai,
-                    bundledPlugin: "zai",
-                    secretKey: ZaiSettingsReader.apiTokenKey,
-                    sourceLabel: "api",
-                    validateContext: { context in
-                        let settings = context.settings?.zai
-                        let region = settings?.apiRegion ?? .global
-                        try ZaiSettingsReader.validateEndpointOverrides(region: region, environment: context.env)
-                        let scope = settings?.usageScope ?? .personal
-                        if scope == .team,
-                           settings?.teamContext == nil,
-                           ZaiBigModelTeamContext(environment: context.env) == nil
-                        {
-                            throw ZaiProviderSettingsError.missingTeamContext
-                        }
-                    },
-                    resolveValues: { context in
-                        let settings = context.settings?.zai
-                        let region = settings?.apiRegion ?? .global
-                        guard let token = ZaiSettingsReader.apiToken(
-                            for: region,
-                            environment: context.env)
-                        else { return nil }
-                        let scope = settings?.usageScope ?? .personal
-                        var plainValues = [
-                            "Z_AI_REGION": region.rawValue,
-                            "Z_AI_USAGE_SCOPE": scope.rawValue,
-                            "Z_AI_QUOTA_ENDPOINT": ZaiEndpointRouter.resolveQuotaURL(
-                                region: region,
-                                environment: context.env).absoluteString,
-                            "Z_AI_MODEL_USAGE_ENDPOINT": ZaiEndpointRouter.resolveModelUsageURL(
-                                region: region,
-                                environment: context.env).absoluteString,
-                        ]
-                        if let team = settings?.teamContext ?? ZaiBigModelTeamContext(environment: context.env) {
-                            plainValues["Z_AI_ORGANIZATION"] = team.organizationID
-                            plainValues["Z_AI_PROJECT"] = team.projectID
-                        }
-                        return ScriptFetchStrategy.Values(
-                            settings: plainValues,
-                            secrets: [ZaiSettingsReader.apiTokenKey: token])
-                    },
-                                    isEnabled: { env in
+                id: "zai.js",
+                provider: .zai,
+                bundledPlugin: "zai",
+                secretKey: ZaiSettingsReader.apiTokenKey,
+                sourceLabel: "api",
+                validateContext: { context in
+                    let settings = context.settings?.zai
+                    let region = settings?.apiRegion ?? .global
+                    try ZaiSettingsReader.validateEndpointOverrides(region: region, environment: context.env)
+                    let scope = settings?.usageScope ?? .personal
+                    if scope == .team,
+                       settings?.teamContext == nil,
+                       ZaiBigModelTeamContext(environment: context.env) == nil
+                    {
+                        throw ZaiProviderSettingsError.missingTeamContext
+                    }
+                },
+                resolveValues: { context in
+                    let settings = context.settings?.zai
+                    let region = settings?.apiRegion ?? .global
+                    guard let token = ZaiSettingsReader.apiToken(
+                        for: region,
+                        environment: context.env)
+                    else { return nil }
+                    let scope = settings?.usageScope ?? .personal
+                    var plainValues = [
+                        "Z_AI_REGION": region.rawValue,
+                        "Z_AI_USAGE_SCOPE": scope.rawValue,
+                        "Z_AI_QUOTA_ENDPOINT": ZaiEndpointRouter.resolveQuotaURL(
+                            region: region,
+                            environment: context.env).absoluteString,
+                        "Z_AI_MODEL_USAGE_ENDPOINT": ZaiEndpointRouter.resolveModelUsageURL(
+                            region: region,
+                            environment: context.env).absoluteString,
+                    ]
+                    if let team = settings?.teamContext ?? ZaiBigModelTeamContext(environment: context.env) {
+                        plainValues["Z_AI_ORGANIZATION"] = team.organizationID
+                        plainValues["Z_AI_PROJECT"] = team.projectID
+                    }
+                    return ScriptFetchStrategy.Values(
+                        settings: plainValues,
+                        secrets: [ZaiSettingsReader.apiTokenKey: token])
+                },
+                isEnabled: { env in
                     // The z.ai API path is used when an explicit credential exists,
                     // including the China-region env/file alias; ZCode-wrapped plans are
                     // handled by the zcode-plan strategy below.

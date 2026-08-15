@@ -43,8 +43,8 @@ public enum ZcodeSettingsReader {
                 providerID: self.startPlanProviderID,
                 plan: .startPlan,
                 config: config),
-        ].compactMap { $0 }
-        guard !candidates.isEmpty else { return nil }
+        ].filter { $0 != nil }
+        guard let firstCandidate = candidates.first else { return nil }
 
         let resolvedStatusURL = statusURL ?? (configURL == nil
             ? self.defaultStatusURL(fileManager: fileManager)
@@ -52,19 +52,19 @@ public enum ZcodeSettingsReader {
         guard let statusData = try? Data(contentsOf: resolvedStatusURL),
               let cache = try? JSONDecoder().decode(ZcodePlanStatusCache.self, from: statusData)
         else {
-            return candidates.first
+            return firstCandidate
         }
 
         if let available = candidates.first(where: {
-            cache.entryStatus.items[$0.providerID]?.status == "available"
-        }) {
-            return available
+            $0 != nil && cache.entryStatus.items[$0!.providerID]?.status == "available"
+        }), let resolved = available {
+            return resolved
         }
 
         let allCandidatesHaveStatus = candidates.allSatisfy {
-            cache.entryStatus.items[$0.providerID] != nil
+            cache.entryStatus.items[$0?.providerID ?? ""] != nil
         }
-        return allCandidatesHaveStatus ? nil : candidates.first
+        return allCandidatesHaveStatus ? nil : firstCandidate
     }
 
     public static func appVersion(
