@@ -33,9 +33,6 @@ struct ProviderPluginDetailsParityTests {
             ProviderPluginPrototype.environmentKey: "1",
             "BIGMODEL_API_KEY": "china-token",
         ]
-        // The JS strategy resolves the API token with the *region-independent* reader
-        // (explicit Z_AI_API_KEY / inferred-region alias), mirroring the pre-plugin
-        // credential pipeline. The region-scoped alias is what `validateContext` guards.
         // Pin HOME to an empty directory so the China-region file alias and the ZCode
         // config lookup are deterministic regardless of the host's real home directory.
         let emptyHome = URL(
@@ -56,12 +53,10 @@ struct ProviderPluginDetailsParityTests {
         let globalContext = Self.context(
             environment: environment,
             settings: .make(zai: .init(apiRegion: .global)))
-        let expectedIDs: [String]
-        if ZcodeSettingsReader.apiToken(configURL: emptyHome.appendingPathComponent(".zcode/v2/config.json")) != nil {
-            expectedIDs = ["zai.js", "zai.zcode-plan"]
-        } else {
-            expectedIDs = ["zai.js"]
-        }
+        let zcodeConfigURL = emptyHome.appendingPathComponent(".zcode/v2/config.json")
+        let expectedIDs = ZcodeSettingsReader.apiToken(configURL: zcodeConfigURL) != nil
+            ? ["zai.js", "zai.zcode-plan"]
+            : ["zai.js"]
 
         let chinaStrategies = await descriptor.fetchPlan.pipeline.resolveStrategies(chinaContext)
         let globalStrategies = await descriptor.fetchPlan.pipeline.resolveStrategies(globalContext)

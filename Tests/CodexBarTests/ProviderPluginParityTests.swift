@@ -31,8 +31,8 @@ struct ProviderPluginParityTests {
             // Pin HOME to an empty directory so credential lookups that fall back to the
             // user's home (China-region alias files, ZCode config) are deterministic.
             let emptyHome = URL(
-            fileURLWithPath: "/tmp/llm-usage-bar-parity-home-\(ProcessInfo.processInfo.processIdentifier)"
-        )
+                fileURLWithPath: "/tmp/llm-usage-bar-parity-home-\(ProcessInfo.processInfo.processIdentifier)"
+            )
             try? FileManager.default.createDirectory(at: emptyHome, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: emptyHome) }
             environment["HOME"] = emptyHome.path
@@ -40,13 +40,10 @@ struct ProviderPluginParityTests {
 
             // zai additionally exposes the ZCode-wrapped plan fallback strategy when a
             // local ZCode credential is present.
-            let expected: [String]
-            if provider == .zai && ZcodeSettingsReader.apiToken(
-                configURL: emptyHome.appendingPathComponent(".zcode/v2/config.json")) != nil {
-                expected = ["zai.js", "zai.zcode-plan"]
-            } else {
-                expected = ["\(provider.rawValue).js"]
-            }
+            let zcodeConfigURL = emptyHome.appendingPathComponent(".zcode/v2/config.json")
+            let expected = provider == .zai && ZcodeSettingsReader.apiToken(configURL: zcodeConfigURL) != nil
+                ? ["zai.js", "zai.zcode-plan"]
+                : ["\(provider.rawValue).js"]
             let strategies = await descriptor.fetchPlan.pipeline.resolveStrategies(context)
             #expect(strategies.map(\.id) == expected)
             #expect(await strategies[0].isAvailable(context))
